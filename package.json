@@ -1,15 +1,9 @@
 {
-  "name": "mexc-cors-proxy",
-  "version": "1.0.0",
-  "description": "CORS proxy for MEXC Trend Trader",
+  "name": "mexc-trader-server",
+  "version": "2.0.0",
+  "description": "MEXC Trend Trader — proxy + auth + 24/7 bot engine",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "cors-anywhere": "^0.4.4"
-  },
-  "engines": {
-    "node": ">=16"
-  }
+  "scripts": { "start": "node server.js" },
+  "dependencies": {},
+  "engines": { "node": ">=16" }
 }
