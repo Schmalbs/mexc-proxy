@@ -36,6 +36,10 @@ function sendTelegram(msg){
   req.end();
 }
 
+// ── Public data cache (3s TTL) ──
+const proxyCache = new Map();
+const mexcPublicCache = new Map();
+
 // ── Session tokens (in-memory) ──
 const tokens = new Set();
 function newToken(){ const t = crypto.randomBytes(24).toString('hex'); tokens.add(t); return t; }
@@ -71,12 +75,25 @@ function mexcRequest(method, path, bodyObj){
   });
 }
 
-// Public (unsigned) GET to MEXC
+// Public (unsigned) GET to MEXC — cached 3s so multiple bots share one call
 function mexcPublic(path){
+  const cached = mexcPublicCache.get(path);
+  if(cached && Date.now() - cached.t < 3000) return Promise.resolve(cached.v);
   return new Promise((resolve, reject)=>{
     https.get(FUTURES_BASE + path, res=>{
       let data=''; res.on('data',d=>data+=d);
-      res.on('end',()=>{ try{ resolve(JSON.parse(data)); }catch(e){ resolve(null); } });
+      res.on('end',()=>{
+        try{
+          const v = JSON.parse(data);
+          if(v && v.success){
+            mexcPublicCache.set(path, { t: Date.now(), v });
+            if(mexcPublicCache.size > 100){
+              mexcPublicCache.delete(mexcPublicCache.keys().next().value);
+            }
+          }
+          resolve(v);
+        }catch(e){ resolve(null); }
+      });
     }).on('error', reject);
   });
 }
@@ -535,13 +552,42 @@ http.createServer(async (req, res)=>{
   const url = req.url;
 
   // ── PROXY: /https://contract.mexc.com/... (public data passthrough) ──
+  // 3-second cache — dedupes bursts so MEXC's per-IP rate limit isn't exhausted
   if(url.startsWith('/https://') || url.startsWith('/http://')){
     const target = url.slice(1);
+
+    const cached = proxyCache.get(target);
+    if(cached && Date.now() - cached.t < 3000){
+      res.writeHead(200, {
+        'Content-Type':'application/json',
+        'Access-Control-Allow-Origin':'*',
+        'Access-Control-Allow-Headers':'*',
+        'X-Cache':'HIT',
+      });
+      return res.end(cached.data);
+    }
+
     try{
       const tu = new URL(target);
       https.get({ hostname: tu.hostname, path: tu.pathname + tu.search }, pres=>{
         let data=''; pres.on('data',d=>data+=d);
         pres.on('end',()=>{
+          if(pres.statusCode === 200){
+            proxyCache.set(target, { t: Date.now(), data });
+            if(proxyCache.size > 200){ // keep cache bounded
+              const oldest = proxyCache.keys().next().value;
+              proxyCache.delete(oldest);
+            }
+          } else if(cached){
+            // Upstream error (e.g. rate limit) — serve stale cache instead
+            res.writeHead(200, {
+              'Content-Type':'application/json',
+              'Access-Control-Allow-Origin':'*',
+              'Access-Control-Allow-Headers':'*',
+              'X-Cache':'STALE',
+            });
+            return res.end(cached.data);
+          }
           res.writeHead(pres.statusCode, {
             'Content-Type':'application/json',
             'Access-Control-Allow-Origin':'*',
