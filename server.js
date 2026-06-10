@@ -18,6 +18,23 @@ const APP_PASSWORD  = process.env.APP_PASSWORD  || '';
 const MEXC_KEY      = process.env.MEXC_API_KEY    || '';
 const MEXC_SECRET   = process.env.MEXC_API_SECRET || '';
 const FUTURES_BASE  = 'https://contract.mexc.com';
+const TG_TOKEN      = process.env.TELEGRAM_BOT_TOKEN || '';
+const TG_CHAT       = process.env.TELEGRAM_CHAT_ID   || '';
+
+// ── Telegram alerts ──
+function sendTelegram(msg){
+  if(!TG_TOKEN || !TG_CHAT) return;
+  const data = JSON.stringify({ chat_id: TG_CHAT, text: msg, parse_mode: 'HTML' });
+  const req = https.request({
+    hostname: 'api.telegram.org',
+    path: `/bot${TG_TOKEN}/sendMessage`,
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
+  }, res => { res.on('data',()=>{}); });
+  req.on('error', ()=>{});
+  req.write(data);
+  req.end();
+}
 
 // ── Session tokens (in-memory) ──
 const tokens = new Set();
@@ -107,10 +124,31 @@ async function placeOrder(symbol, side, vol, leverage, openType, price, type){
   });
 }
 
+let syncCounter = 0;
+
 async function botTick(){
   if(!botConfig) return;
   try{
     const cfg = botConfig;
+    syncCounter++;
+
+    // ── POSITION SYNC CHECK every ~32s ──
+    // Verify the position still exists on MEXC (user may have closed it manually)
+    if(activeTrade && syncCounter % 4 === 0){
+      const d = await mexcRequest('GET','/api/v1/private/position/open_positions');
+      if(d.success){
+        const stillOpen = (d.data||[]).some(p =>
+          p.symbol === cfg.symbol && parseFloat(p.holdVol) > 0 &&
+          ((activeTrade.side==='BUY'  && p.positionType===1) ||
+           (activeTrade.side==='SELL' && p.positionType===2)));
+        if(!stillOpen){
+          blog('⚠️ Position closed externally on MEXC — clearing bot tracking','warn');
+          sendTelegram('⚠️ <b>Position closed externally</b> on MEXC — bot tracking cleared. Bot remains armed for next trigger.');
+          activeTrade = null;
+          return;
+        }
+      }
+    }
 
     // ── Manage open trade exits ──
     if(activeTrade){
@@ -175,6 +213,7 @@ async function botTick(){
 
     if(!triggered) return;
     blog(`🔔 Trigger! Candle closed ${dir} ${triggerLabel} @ ${candle.close}`, 'ok');
+    sendTelegram(`🔔 <b>Entry trigger fired!</b>\n${cfg.symbol} candle closed ${dir} ${triggerLabel}\nClose: $${candle.close}`);
 
     // Calculate TP/SL prices
     const entry = candle.close;
@@ -193,6 +232,7 @@ async function botTick(){
     const res = await placeOrder(cfg.symbol, futSide, cfg.qty, cfg.leverage, cfg.marginType==='isolated'?1:2, 0, 5);
     if(res.success){
       blog(`✅ Order placed! ID: ${res.data}`, 'ok');
+      sendTelegram(`✅ <b>${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${cfg.qty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}`);
       activeTrade = {
         side, entryPrice: entry, tpPrice, slPrice, qty: cfg.qty,
         leverage: cfg.leverage,
@@ -203,6 +243,7 @@ async function botTick(){
       lastTpCandle = null; lastSlCandle = null;
     } else {
       blog(`Order error: ${JSON.stringify(res)}`, 'err');
+      sendTelegram(`❌ <b>Order failed</b>\n${JSON.stringify(res).slice(0,200)}`);
     }
   }catch(e){
     blog(`Bot tick error: ${e.message}`, 'err');
@@ -215,6 +256,8 @@ async function exitTrade(reason, price){
   const dir = t.side==='BUY'?1:-1;
   const pct = ((price - t.entryPrice)/t.entryPrice*100*dir*(t.leverage||1)).toFixed(2);
   blog(`🏁 ${reason} hit @ ${price} | P&L: ${pct>=0?'+':''}${pct}%`, pct>=0?'ok':'err');
+  const emoji = pct>=0 ? '💰' : '🔻';
+  sendTelegram(`${emoji} <b>${reason} — trade closed</b>\nExit: $${price}\nP&L: ${pct>=0?'+':''}${pct}%`);
   const closeSide = t.side==='BUY' ? 4 : 2; // close long / close short
   const res = await placeOrder(botConfig.symbol, closeSide, t.qty, t.leverage, 1, 0, 5);
   if(res.success) blog(`✅ Exit order placed. ID: ${res.data}`, 'ok');
@@ -312,12 +355,14 @@ http.createServer(async (req, res)=>{
     botConfig = await readBody(req);
     lastCandleTime = null;
     blog(`Bot ARMED — ${botConfig.symbol} | trigger: candle close ${botConfig.dir} [${botConfig.trigTf}] | source: ${botConfig.triggerSource}`, 'ok');
+    sendTelegram(`🤖 <b>Bot ARMED</b>\n${botConfig.symbol} — waiting for candle close ${botConfig.dir} [${botConfig.trigTf}]`);
     return json(res,200,{armed:true});
   }
 
   if(url==='/bot/disarm' && req.method==='POST'){
     botConfig = null;
     blog('Bot DISARMED','warn');
+    sendTelegram('🛑 <b>Bot DISARMED</b>');
     return json(res,200,{armed:false});
   }
 
@@ -356,9 +401,42 @@ http.createServer(async (req, res)=>{
 
   if(url==='/trade/close' && req.method==='POST'){
     if(!activeTrade) return json(res,400,{error:'no active trade'});
-    const price = await getTicker(botConfig ? botConfig.symbol : 'BTC_USDT');
-    await exitTrade('MANUAL', price || activeTrade.entryPrice);
-    return json(res,200,{closed:true});
+    const b = await readBody(req);
+    const fraction = Math.min(1, Math.max(0, parseFloat(b.fraction)||1));
+    const symbol = botConfig ? botConfig.symbol : (b.symbol||'BTC_USDT');
+    const price = await getTicker(symbol);
+
+    if(fraction >= 0.999){
+      await exitTrade('MANUAL', price || activeTrade.entryPrice);
+      return json(res,200,{closed:true, fraction:1});
+    }
+
+    // Partial close
+    const closeVol = Math.max(1, Math.floor(activeTrade.qty * fraction));
+    const closeSide = activeTrade.side==='BUY' ? 4 : 2;
+    const r = await placeOrder(symbol, closeSide, closeVol, activeTrade.leverage, 1, 0, 5);
+    if(r.success){
+      activeTrade.qty -= closeVol;
+      blog(`Partial close ${Math.round(fraction*100)}% (${closeVol} contracts) @ ${price}`, 'ok');
+      if(activeTrade.qty <= 0) activeTrade = null;
+      return json(res,200,{closed:true, fraction, remaining: activeTrade ? activeTrade.qty : 0});
+    }
+    return json(res,500,r);
+  }
+
+  // Close a raw MEXC position (not app-managed)
+  if(url==='/position/close' && req.method==='POST'){
+    const b = await readBody(req);
+    // positionType: 1=long → close side 4; 2=short → close side 2
+    const closeSide = b.positionType === 1 ? 4 : 2;
+    const vol = Math.max(1, Math.floor(parseFloat(b.vol)||0));
+    if(!vol || !b.symbol) return json(res,400,{error:'symbol and vol required'});
+    const r = await placeOrder(b.symbol, closeSide, vol, b.leverage||1, 1, 0, 5);
+    if(r.success){
+      blog(`Closed ${vol} contracts of ${b.symbol} (MEXC position)`, 'ok');
+      return json(res,200,{closed:true, vol});
+    }
+    return json(res,500,r);
   }
 
   json(res,404,{error:'not found'});
@@ -367,4 +445,5 @@ http.createServer(async (req, res)=>{
   console.log(`MEXC Trend Trader server on :${PORT}`);
   console.log(APP_PASSWORD ? '🔒 Password auth enabled' : '⚠️  Set APP_PASSWORD env var!');
   console.log(MEXC_KEY ? '🔑 MEXC keys loaded' : '⚠️  Set MEXC_API_KEY / MEXC_API_SECRET env vars!');
+  console.log(TG_TOKEN && TG_CHAT ? '📨 Telegram alerts enabled' : 'ℹ️  Telegram off — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to enable');
 });
