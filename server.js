@@ -84,10 +84,9 @@ function mexcPublic(path){
 // ─────────────────────────────────────────────────────────────
 // BOT ENGINE — runs 24/7 server-side
 // ─────────────────────────────────────────────────────────────
-let botConfig   = null;   // armed config from client
-let activeTrade = null;   // server-managed open trade
-let botLogs     = [];     // recent log lines for client display
-let lastCandleTime = null, lastTpCandle = null, lastSlCandle = null;
+let bots         = [];   // [{id, config, activeTrade, lastCandleTime, lastTpCandle, lastSlCandle, syncCounter}]
+let botIdCounter = 0;
+let botLogs      = [];    // recent log lines for client display
 
 function blog(msg, type=''){
   const line = { t: new Date().toISOString(), msg, type };
@@ -124,148 +123,383 @@ async function placeOrder(symbol, side, vol, leverage, openType, price, type){
   });
 }
 
-let syncCounter = 0;
-
 async function botTick(){
-  if(!botConfig) return;
-  try{
-    const cfg = botConfig;
-    syncCounter++;
-
-    // ── POSITION SYNC CHECK every ~32s ──
-    // Verify the position still exists on MEXC (user may have closed it manually)
-    if(activeTrade && syncCounter % 4 === 0){
-      const d = await mexcRequest('GET','/api/v1/private/position/open_positions');
-      if(d.success){
-        const stillOpen = (d.data||[]).some(p =>
-          p.symbol === cfg.symbol && parseFloat(p.holdVol) > 0 &&
-          ((activeTrade.side==='BUY'  && p.positionType===1) ||
-           (activeTrade.side==='SELL' && p.positionType===2)));
-        if(!stillOpen){
-          blog('⚠️ Position closed externally on MEXC — clearing bot tracking','warn');
-          sendTelegram('⚠️ <b>Position closed externally</b> on MEXC — bot tracking cleared. Bot remains armed for next trigger.');
-          activeTrade = null;
-          return;
-        }
-      }
-    }
-
-    // ── Manage open trade exits ──
-    if(activeTrade){
-      const t = activeTrade;
-      // Price-hit exits
-      const price = await getTicker(cfg.symbol);
-      if(price != null){
-        if(t.tp.type==='price' || t.tp.mode==='price'){
-          const hit = t.side==='BUY' ? price >= t.tpPrice : price <= t.tpPrice;
-          if(hit) return exitTrade('TP', price);
-        }
-        if(t.sl.mode==='price'){
-          const hit = t.side==='BUY' ? price <= t.slPrice : price >= t.slPrice;
-          if(hit) return exitTrade('SL', price);
-        }
-      }
-      // Candle-close exits
-      if(t.tp.mode==='candle'){
-        const c = await getLastClosedCandle(cfg.symbol, t.tp.tf);
-        if(c && c.time !== lastTpCandle){
-          lastTpCandle = c.time;
-          const hit = t.side==='BUY' ? c.close >= t.tpPrice : c.close <= t.tpPrice;
-          if(hit) return exitTrade('TP (candle)', c.close);
-        }
-      }
-      if(t.sl.mode==='candle'){
-        const c = await getLastClosedCandle(cfg.symbol, t.sl.tf);
-        if(c && c.time !== lastSlCandle){
-          lastSlCandle = c.time;
-          const hit = t.side==='BUY' ? c.close <= t.slPrice : c.close >= t.slPrice;
-          if(hit) return exitTrade('SL (candle)', c.close);
-        }
-      }
-      return; // trade open — don't look for new entries
-    }
-
-    // ── Look for entry trigger ──
-    const candle = await getLastClosedCandle(cfg.symbol, cfg.trigTf);
-    if(!candle || candle.time === lastCandleTime) return;
-    lastCandleTime = candle.time;
-
-    const dir  = cfg.dir; // 'above' or 'below'
-    const side = dir==='above' ? 'BUY' : 'SELL';
-    let triggered = false, triggerLabel = '';
-
-    if(cfg.triggerSource === 'price'){
-      const tp = parseFloat(cfg.manualPrice);
-      triggered = (dir==='above' && candle.close > tp) || (dir==='below' && candle.close < tp);
-      triggerLabel = `manual price ${tp}`;
-    } else {
-      const lines = cfg.selectedLineId==='all'
-        ? cfg.lines
-        : cfg.lines.filter(l => String(l.id)===String(cfg.selectedLineId));
-      for(const line of lines){
-        const lp = priceOnLine(line, candle.time);
-        if((dir==='above' && candle.close > lp) || (dir==='below' && candle.close < lp)){
-          triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(4)}`;
-          break;
-        }
-      }
-    }
-
-    if(!triggered) return;
-    blog(`🔔 Trigger! Candle closed ${dir} ${triggerLabel} @ ${candle.close}`, 'ok');
-    sendTelegram(`🔔 <b>Entry trigger fired!</b>\n${cfg.symbol} candle closed ${dir} ${triggerLabel}\nClose: $${candle.close}`);
-
-    // Calculate TP/SL prices
-    const entry = candle.close;
-    const tpPrice = cfg.tp.type==='price' ? parseFloat(cfg.tp.value)
-      : (side==='BUY' ? entry*(1+cfg.tp.value/100) : entry*(1-cfg.tp.value/100));
-    const slPrice = cfg.sl.type==='price' ? parseFloat(cfg.sl.value)
-      : (side==='BUY' ? entry*(1-cfg.sl.value/100) : entry*(1+cfg.sl.value/100));
-
-    // Set leverage then place order
-    if(cfg.leverage > 1){
-      await mexcRequest('POST','/api/v1/private/position/change_leverage',{
-        symbol: cfg.symbol, leverage: cfg.leverage, openType: cfg.marginType==='isolated'?1:2
-      }).catch(()=>{});
-    }
-    const futSide = side==='BUY' ? 1 : 3;
-    const res = await placeOrder(cfg.symbol, futSide, cfg.qty, cfg.leverage, cfg.marginType==='isolated'?1:2, 0, 5);
-    if(res.success){
-      blog(`✅ Order placed! ID: ${res.data}`, 'ok');
-      sendTelegram(`✅ <b>${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${cfg.qty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}`);
-      activeTrade = {
-        side, entryPrice: entry, tpPrice, slPrice, qty: cfg.qty,
-        leverage: cfg.leverage,
-        tp: { mode: cfg.tp.mode, tf: cfg.tp.tf },
-        sl: { mode: cfg.sl.mode, tf: cfg.sl.tf },
-        openedAt: Date.now(),
-      };
-      lastTpCandle = null; lastSlCandle = null;
-    } else {
-      blog(`Order error: ${JSON.stringify(res)}`, 'err');
-      sendTelegram(`❌ <b>Order failed</b>\n${JSON.stringify(res).slice(0,200)}`);
-    }
-  }catch(e){
-    blog(`Bot tick error: ${e.message}`, 'err');
+  // Iterate over a copy so disarms during the loop are safe
+  for(const bot of [...bots]){
+    await runBot(bot).catch(e => blog(`Bot #${bot.id} tick error: ${e.message}`,'err'));
   }
 }
 
-async function exitTrade(reason, price){
-  if(!activeTrade) return;
-  const t = activeTrade;
+async function runBot(bot){
+  const cfg = bot.config;
+  bot.syncCounter = (bot.syncCounter||0) + 1;
+
+  // ── POSITION SYNC CHECK every ~32s ──
+  if(bot.activeTrade && bot.syncCounter % 4 === 0){
+    const d = await mexcRequest('GET','/api/v1/private/position/open_positions');
+    if(d.success){
+      const stillOpen = (d.data||[]).some(p =>
+        p.symbol === cfg.symbol && parseFloat(p.holdVol) > 0 &&
+        ((bot.activeTrade.side==='BUY'  && p.positionType===1) ||
+         (bot.activeTrade.side==='SELL' && p.positionType===2)));
+      if(!stillOpen){
+        blog(`⚠️ Bot #${bot.id}: position closed externally on MEXC — clearing tracking`,'warn');
+        sendTelegram(`⚠️ <b>Bot #${bot.id}: position closed externally</b> on MEXC — tracking cleared. Bot remains armed.`);
+        bot.activeTrade = null;
+        return;
+      }
+    }
+  }
+
+  // ── Manage open trade exits ──
+  if(bot.activeTrade){
+    const t = bot.activeTrade;
+    const price = await getTicker(cfg.symbol);
+    if(price != null){
+      if(t.tp.type==='price' || t.tp.mode==='price'){
+        const hit = t.side==='BUY' ? price >= t.tpPrice : price <= t.tpPrice;
+        if(hit) return exitTrade(bot, 'TP', price);
+      }
+      if(t.sl.mode==='price'){
+        const hit = t.side==='BUY' ? price <= t.slPrice : price >= t.slPrice;
+        if(hit) return exitTrade(bot, 'SL', price);
+      }
+    }
+    if(t.tp.mode==='candle'){
+      const c = await getLastClosedCandle(cfg.symbol, t.tp.tf);
+      if(c && c.time !== bot.lastTpCandle){
+        bot.lastTpCandle = c.time;
+        const hit = t.side==='BUY' ? c.close >= t.tpPrice : c.close <= t.tpPrice;
+        if(hit) return exitTrade(bot, 'TP (candle)', c.close);
+      }
+    }
+    if(t.sl.mode==='candle'){
+      const c = await getLastClosedCandle(cfg.symbol, t.sl.tf);
+      if(c && c.time !== bot.lastSlCandle){
+        bot.lastSlCandle = c.time;
+        const hit = t.side==='BUY' ? c.close <= t.slPrice : c.close >= t.slPrice;
+        if(hit) return exitTrade(bot, 'SL (candle)', c.close);
+      }
+    }
+    return; // trade open — this bot doesn't look for new entries
+  }
+
+  // Manual-trade bots only manage exits — no entry triggers
+  if(cfg.manualOnly) {
+    // trade closed and nothing to watch → remove this bot
+    bots = bots.filter(b => b.id !== bot.id);
+    return;
+  }
+
+  // ── Look for entry trigger ──
+  const candle = await getLastClosedCandle(cfg.symbol, cfg.trigTf);
+  if(!candle || candle.time === bot.lastCandleTime) return;
+  bot.lastCandleTime = candle.time;
+
+  const dir  = cfg.dir;
+  const side = dir==='above' ? 'BUY' : 'SELL';
+  let triggered = false, triggerLabel = '';
+
+  if(cfg.triggerSource === 'price'){
+    const tp = parseFloat(cfg.manualPrice);
+    triggered = (dir==='above' && candle.close > tp) || (dir==='below' && candle.close < tp);
+    triggerLabel = `manual price ${tp}`;
+  } else {
+    const lines = cfg.selectedLineId==='all'
+      ? cfg.lines
+      : cfg.lines.filter(l => String(l.id)===String(cfg.selectedLineId));
+    for(const line of lines){
+      const lp = priceOnLine(line, candle.time);
+      if((dir==='above' && candle.close > lp) || (dir==='below' && candle.close < lp)){
+        triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(4)}`;
+        break;
+      }
+    }
+  }
+
+  if(!triggered) return;
+  blog(`🔔 Bot #${bot.id} trigger! Candle closed ${dir} ${triggerLabel} @ ${candle.close}`, 'ok');
+  sendTelegram(`🔔 <b>Bot #${bot.id} trigger fired!</b>\n${cfg.symbol} candle closed ${dir} ${triggerLabel}\nClose: $${candle.close}`);
+
+  const entry = candle.close;
+  const tpPrice = cfg.tp.type==='price' ? parseFloat(cfg.tp.value)
+    : (side==='BUY' ? entry*(1+cfg.tp.value/100) : entry*(1-cfg.tp.value/100));
+  const slPrice = cfg.sl.type==='price' ? parseFloat(cfg.sl.value)
+    : (side==='BUY' ? entry*(1-cfg.sl.value/100) : entry*(1+cfg.sl.value/100));
+
+  if(cfg.leverage > 1){
+    await mexcRequest('POST','/api/v1/private/position/change_leverage',{
+      symbol: cfg.symbol, leverage: cfg.leverage, openType: cfg.marginType==='isolated'?1:2
+    }).catch(()=>{});
+  }
+  const futSide = side==='BUY' ? 1 : 3;
+  const res = await placeOrder(cfg.symbol, futSide, cfg.qty, cfg.leverage, cfg.marginType==='isolated'?1:2, 0, 5);
+  if(res.success){
+    blog(`✅ Bot #${bot.id} order placed! ID: ${res.data}`, 'ok');
+    sendTelegram(`✅ <b>Bot #${bot.id}: ${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${cfg.qty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}`);
+    bot.activeTrade = {
+      side, entryPrice: entry, tpPrice, slPrice, qty: cfg.qty,
+      leverage: cfg.leverage,
+      tp: { mode: cfg.tp.mode, tf: cfg.tp.tf },
+      sl: { mode: cfg.sl.mode, tf: cfg.sl.tf },
+      openedAt: Date.now(),
+    };
+    bot.lastTpCandle = null; bot.lastSlCandle = null;
+  } else {
+    blog(`Bot #${bot.id} order error: ${JSON.stringify(res)}`, 'err');
+    sendTelegram(`❌ <b>Bot #${bot.id} order failed</b>\n${JSON.stringify(res).slice(0,200)}`);
+  }
+}
+
+async function exitTrade(bot, reason, price){
+  if(!bot.activeTrade) return;
+  const t = bot.activeTrade;
   const dir = t.side==='BUY'?1:-1;
   const pct = ((price - t.entryPrice)/t.entryPrice*100*dir*(t.leverage||1)).toFixed(2);
-  blog(`🏁 ${reason} hit @ ${price} | P&L: ${pct>=0?'+':''}${pct}%`, pct>=0?'ok':'err');
+  blog(`🏁 Bot #${bot.id} ${reason} hit @ ${price} | P&L: ${pct>=0?'+':''}${pct}%`, pct>=0?'ok':'err');
   const emoji = pct>=0 ? '💰' : '🔻';
-  sendTelegram(`${emoji} <b>${reason} — trade closed</b>\nExit: $${price}\nP&L: ${pct>=0?'+':''}${pct}%`);
-  const closeSide = t.side==='BUY' ? 4 : 2; // close long / close short
-  const res = await placeOrder(botConfig.symbol, closeSide, t.qty, t.leverage, 1, 0, 5);
+  sendTelegram(`${emoji} <b>Bot #${bot.id} ${reason} — trade closed</b>\nExit: $${price}\nP&L: ${pct>=0?'+':''}${pct}%`);
+  const closeSide = t.side==='BUY' ? 4 : 2;
+  const res = await placeOrder(bot.config.symbol, closeSide, t.qty, t.leverage, 1, 0, 5);
   if(res.success) blog(`✅ Exit order placed. ID: ${res.data}`, 'ok');
   else blog(`Exit order error: ${JSON.stringify(res)}`, 'err');
-  activeTrade = null;
+  bot.activeTrade = null;
+  // Manual-only bots are done once their trade closes
+  if(bot.config.manualOnly) bots = bots.filter(b => b.id !== bot.id);
 }
 
 setInterval(botTick, 8000); // bot heartbeat every 8s
+
+// ─────────────────────────────────────────────────────────────
+// AI TRADER — Claude makes every trading decision via the API
+// ─────────────────────────────────────────────────────────────
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+
+let aiTrader = {
+  enabled: false,
+  symbol: 'BTC_USDT',
+  decisionTf: 'Min60',        // decision cadence = 1h candle closes
+  allocatedUsd: 100,          // the AI's trading allocation
+  startBalance: 100,          // for drawdown kill-switch
+  maxLeverage: 10,
+  maxRiskPct: 5,              // max % of allocation risked per trade
+  killSwitchPct: 50,          // stop everything at -50%
+  position: null,             // { side, entryPrice, qty, leverage, tpPrice, slPrice }
+  realizedPnl: 0,
+  decisions: [],              // log of decisions with reasoning
+  lastDecisionCandle: null,
+  tradeHistory: [],           // closed trades for context
+};
+
+function aiLog(msg, type=''){
+  blog(`[AI] ${msg}`, type);
+}
+
+function callClaude(prompt){
+  return new Promise((resolve, reject)=>{
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1024,
+      messages: [{ role:'user', content: prompt }],
+    });
+    const req = https.request({
+      hostname: 'api.anthropic.com',
+      path: '/v1/messages',
+      method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      }
+    }, res=>{
+      let data=''; res.on('data',d=>data+=d);
+      res.on('end',()=>{
+        try{
+          const j = JSON.parse(data);
+          const text = (j.content||[]).map(b=>b.text||'').join('');
+          resolve(text);
+        }catch(e){ reject(new Error('Claude API parse error: '+data.slice(0,200))); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+async function aiTraderTick(){
+  if(!aiTrader.enabled || !ANTHROPIC_KEY) return;
+  try{
+    // Kill switch check
+    const equity = aiTrader.allocatedUsd + aiTrader.realizedPnl + aiUnrealized();
+    if(equity <= aiTrader.startBalance * (1 - aiTrader.killSwitchPct/100)){
+      aiLog(`💀 KILL SWITCH — equity $${equity.toFixed(2)} hit -${aiTrader.killSwitchPct}% drawdown. AI trading stopped.`,'err');
+      sendTelegram(`💀 <b>AI Trader kill switch</b>\nEquity: $${equity.toFixed(2)} — trading stopped.`);
+      if(aiTrader.position) await aiClosePosition('KILL SWITCH');
+      aiTrader.enabled = false;
+      return;
+    }
+
+    // Manage open position exits first (price-based TP/SL every tick)
+    if(aiTrader.position){
+      const p = await getTicker(aiTrader.symbol);
+      if(p != null){
+        const pos = aiTrader.position;
+        const tpHit = pos.side==='BUY' ? p >= pos.tpPrice : p <= pos.tpPrice;
+        const slHit = pos.side==='BUY' ? p <= pos.slPrice : p >= pos.slPrice;
+        if(tpHit) return aiClosePosition('TP', p);
+        if(slHit) return aiClosePosition('SL', p);
+      }
+    }
+
+    // Decision only on new candle close of decision TF
+    const candle = await getLastClosedCandle(aiTrader.symbol, aiTrader.decisionTf);
+    if(!candle || candle.time === aiTrader.lastDecisionCandle) return;
+    aiTrader.lastDecisionCandle = candle.time;
+
+    // Gather context: last 100 candles
+    const k = await mexcPublic(`/api/v1/contract/kline/${aiTrader.symbol}?interval=${aiTrader.decisionTf}&limit=100`);
+    if(!k || !k.success) return;
+    const candleData = k.data.time.map((t,i)=>
+      `${new Date(parseInt(t)*1000).toISOString().slice(0,16)} O:${k.data.open[i]} H:${k.data.high[i]} L:${k.data.low[i]} C:${k.data.close[i]} V:${k.data.vol[i]}`
+    ).join('\n');
+
+    const posStr = aiTrader.position
+      ? `OPEN POSITION: ${aiTrader.position.side} ${aiTrader.position.qty} contracts @ $${aiTrader.position.entryPrice} | ${aiTrader.position.leverage}x | TP $${aiTrader.position.tpPrice} | SL $${aiTrader.position.slPrice}`
+      : 'NO OPEN POSITION';
+
+    const histStr = aiTrader.tradeHistory.slice(-10).map(t=>
+      `${t.side} entry:$${t.entry} exit:$${t.exit} pnl:${t.pnl>=0?'+':''}$${t.pnl.toFixed(2)} (${t.reason})`
+    ).join('\n') || 'No closed trades yet';
+
+    const prompt = `You are an autonomous crypto futures trader managing a small real-money account. Your decisions are executed immediately on MEXC ${aiTrader.symbol} perpetual futures.
+
+ACCOUNT STATE:
+- Allocation: $${aiTrader.allocatedUsd}
+- Realized P&L: ${aiTrader.realizedPnl>=0?'+':''}$${aiTrader.realizedPnl.toFixed(2)}
+- Current equity: $${equity.toFixed(2)}
+- ${posStr}
+
+RECENT CLOSED TRADES:
+${histStr}
+
+LAST 100 CANDLES (${aiTrader.decisionTf}):
+${candleData}
+
+RULES:
+- Max leverage: ${aiTrader.maxLeverage}x
+- Max risk per trade: ${aiTrader.maxRiskPct}% of equity (SL distance x size must not exceed this)
+- You may: open a long, open a short, close the current position, adjust TP/SL, or do nothing
+- Be selective — overtrading loses to fees. No trade is a valid choice.
+- Think about trend, momentum, support/resistance, and risk/reward before deciding.
+
+Respond ONLY with JSON, no other text:
+{"action":"long"|"short"|"close"|"adjust"|"hold","leverage":1-${aiTrader.maxLeverage},"riskPct":0.5-${aiTrader.maxRiskPct},"tpPrice":number,"slPrice":number,"reasoning":"one concise paragraph"}`;
+
+    aiLog(`Requesting decision from Claude (candle close ${candle.close})...`,'info');
+    const raw = await callClaude(prompt);
+    let decision;
+    try{
+      decision = JSON.parse(raw.replace(/```json|```/g,'').trim());
+    }catch(e){
+      aiLog(`Could not parse decision: ${raw.slice(0,150)}`,'err');
+      return;
+    }
+
+    aiTrader.decisions.push({ t: Date.now(), candle: candle.close, ...decision });
+    if(aiTrader.decisions.length > 50) aiTrader.decisions.shift();
+    aiLog(`Decision: ${decision.action.toUpperCase()} — ${decision.reasoning}`, 'info');
+
+    // Execute decision
+    if(decision.action === 'hold') return;
+
+    if(decision.action === 'close' && aiTrader.position){
+      const p = await getTicker(aiTrader.symbol);
+      return aiClosePosition('AI decision', p);
+    }
+
+    if((decision.action === 'long' || decision.action === 'short')){
+      if(aiTrader.position){
+        // Close existing first if direction differs
+        const wantSide = decision.action==='long' ? 'BUY':'SELL';
+        if(aiTrader.position.side !== wantSide){
+          const p = await getTicker(aiTrader.symbol);
+          await aiClosePosition('Flip', p);
+        } else {
+          // Same direction — treat as adjust
+          aiTrader.position.tpPrice = decision.tpPrice;
+          aiTrader.position.slPrice = decision.slPrice;
+          aiLog(`Adjusted TP→$${decision.tpPrice} SL→$${decision.slPrice}`,'info');
+          return;
+        }
+      }
+      // Size the position: risk = equity * riskPct; qty from SL distance
+      const entry = candle.close;
+      const lev = Math.min(aiTrader.maxLeverage, Math.max(1, parseInt(decision.leverage)||1));
+      const riskUsd = equity * Math.min(aiTrader.maxRiskPct, decision.riskPct||2)/100;
+      const slDist = Math.abs(entry - decision.slPrice);
+      if(slDist <= 0){ aiLog('Invalid SL distance — skipping','warn'); return; }
+      // contracts: MEXC BTC_USDT contract = 0.0001 BTC
+      const contractSize = 0.0001;
+      let qty = Math.floor(riskUsd / (slDist * contractSize));
+      qty = Math.max(1, qty);
+      // Cap position notional at equity * leverage
+      const maxQty = Math.floor((equity * lev) / (entry * contractSize));
+      qty = Math.min(qty, Math.max(1, maxQty));
+
+      const futSide = decision.action==='long' ? 1 : 3;
+      if(lev > 1){
+        await mexcRequest('POST','/api/v1/private/position/change_leverage',{
+          symbol: aiTrader.symbol, leverage: lev, openType: 1
+        }).catch(()=>{});
+      }
+      const r = await placeOrder(aiTrader.symbol, futSide, qty, lev, 1, 0, 5);
+      if(r.success){
+        aiTrader.position = {
+          side: decision.action==='long'?'BUY':'SELL',
+          entryPrice: entry, qty, leverage: lev,
+          tpPrice: decision.tpPrice, slPrice: decision.slPrice,
+          openedAt: Date.now(),
+        };
+        aiLog(`✅ ${decision.action.toUpperCase()} opened: ${qty} contracts @ $${entry} | ${lev}x | TP $${decision.tpPrice} SL $${decision.slPrice}`,'ok');
+        sendTelegram(`🤖🧠 <b>AI ${decision.action.toUpperCase()}</b> ${aiTrader.symbol}\nEntry $${entry} | ${lev}x | ${qty} contracts\nTP $${decision.tpPrice} | SL $${decision.slPrice}\n\n<i>${decision.reasoning}</i>`);
+      } else {
+        aiLog(`Order failed: ${JSON.stringify(r).slice(0,150)}`,'err');
+      }
+    }
+  }catch(e){
+    aiLog(`AI tick error: ${e.message}`,'err');
+  }
+}
+
+function aiUnrealized(){
+  // best-effort: computed at decision time only (live price not always available sync)
+  return 0;
+}
+
+async function aiClosePosition(reason, price){
+  const pos = aiTrader.position;
+  if(!pos) return;
+  if(price == null) price = await getTicker(aiTrader.symbol) || pos.entryPrice;
+  const closeSide = pos.side==='BUY' ? 4 : 2;
+  const r = await placeOrder(aiTrader.symbol, closeSide, pos.qty, pos.leverage, 1, 0, 5);
+  if(r.success){
+    const dir = pos.side==='BUY'?1:-1;
+    const contractSize = 0.0001;
+    const pnl = (price - pos.entryPrice) * pos.qty * contractSize * dir;
+    aiTrader.realizedPnl += pnl;
+    aiTrader.tradeHistory.push({ side: pos.side, entry: pos.entryPrice, exit: price, pnl, reason, t: Date.now() });
+    if(aiTrader.tradeHistory.length > 50) aiTrader.tradeHistory.shift();
+    const emoji = pnl>=0 ? '💰' : '🔻';
+    aiLog(`${emoji} ${reason}: closed ${pos.side} @ $${price} | P&L ${pnl>=0?'+':''}$${pnl.toFixed(2)} | Total: ${aiTrader.realizedPnl>=0?'+':''}$${aiTrader.realizedPnl.toFixed(2)}`, pnl>=0?'ok':'err');
+    sendTelegram(`${emoji} <b>AI closed ${pos.side}</b> (${reason})\nExit $${price}\nTrade P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}\nAI total: ${aiTrader.realizedPnl>=0?'+':''}$${aiTrader.realizedPnl.toFixed(2)}`);
+    aiTrader.position = null;
+  } else {
+    aiLog(`Close failed: ${JSON.stringify(r).slice(0,150)}`,'err');
+  }
+}
+
+setInterval(aiTraderTick, 10000); // AI heartbeat every 10s
 
 // ─────────────────────────────────────────────────────────────
 // HTTP SERVER
@@ -352,25 +586,49 @@ http.createServer(async (req, res)=>{
 
   // ── BOT ──
   if(url==='/bot/arm' && req.method==='POST'){
-    botConfig = await readBody(req);
-    lastCandleTime = null;
-    blog(`Bot ARMED — ${botConfig.symbol} | trigger: candle close ${botConfig.dir} [${botConfig.trigTf}] | source: ${botConfig.triggerSource}`, 'ok');
-    sendTelegram(`🤖 <b>Bot ARMED</b>\n${botConfig.symbol} — waiting for candle close ${botConfig.dir} [${botConfig.trigTf}]`);
-    return json(res,200,{armed:true});
+    const config = await readBody(req);
+    const bot = { id: ++botIdCounter, config, activeTrade: null, lastCandleTime: null, lastTpCandle: null, lastSlCandle: null, syncCounter: 0 };
+    bots.push(bot);
+    const srcLabel = config.triggerSource==='price' ? `price ${config.manualPrice}` : `line ${config.selectedLineId}`;
+    blog(`Bot #${bot.id} ARMED — ${config.symbol} | close ${config.dir} ${srcLabel} [${config.trigTf}] | ${bots.length} bot(s) running`, 'ok');
+    sendTelegram(`🤖 <b>Bot #${bot.id} ARMED</b>\n${config.symbol} — candle close ${config.dir} ${srcLabel} [${config.trigTf}]\nTotal bots: ${bots.length}`);
+    return json(res,200,{armed:true, id: bot.id, totalBots: bots.length});
   }
 
   if(url==='/bot/disarm' && req.method==='POST'){
-    botConfig = null;
-    blog('Bot DISARMED','warn');
-    sendTelegram('🛑 <b>Bot DISARMED</b>');
-    return json(res,200,{armed:false});
+    const b = await readBody(req);
+    if(b.id != null){
+      const bot = bots.find(x => x.id === parseInt(b.id));
+      if(!bot) return json(res,404,{error:'bot not found'});
+      bots = bots.filter(x => x.id !== bot.id);
+      blog(`Bot #${bot.id} DISARMED${bot.activeTrade?' (its open trade is no longer managed!)':''} — ${bots.length} bot(s) remaining`,'warn');
+      sendTelegram(`🛑 <b>Bot #${bot.id} disarmed</b> — ${bots.length} remaining`);
+      return json(res,200,{armed: bots.length>0, removed: bot.id, totalBots: bots.length});
+    }
+    // No id = disarm all
+    const n = bots.length;
+    bots = [];
+    blog(`All ${n} bot(s) DISARMED`,'warn');
+    sendTelegram('🛑 <b>All bots disarmed</b>');
+    return json(res,200,{armed:false, totalBots: 0});
   }
 
   if(url==='/bot/status'){
     return json(res,200,{
-      armed: !!botConfig,
-      config: botConfig,
-      activeTrade,
+      armed: bots.length > 0,
+      bots: bots.map(b => ({
+        id: b.id,
+        symbol: b.config.symbol,
+        dir: b.config.dir,
+        trigTf: b.config.trigTf,
+        triggerSource: b.config.triggerSource,
+        manualPrice: b.config.manualPrice,
+        selectedLineId: b.config.selectedLineId,
+        manualOnly: !!b.config.manualOnly,
+        leverage: b.config.leverage,
+        qty: b.config.qty,
+        activeTrade: b.activeTrade,
+      })),
       logs: botLogs.slice(-20),
     });
   }
@@ -386,40 +644,54 @@ http.createServer(async (req, res)=>{
     const futSide = b.side==='BUY' ? 1 : 3;
     const r = await placeOrder(b.symbol, futSide, b.qty, b.leverage, b.marginType==='isolated'?1:2, b.limitPrice||0, b.orderType==='LIMIT'?1:5);
     if(r.success){
-      activeTrade = {
-        side: b.side, entryPrice: b.entryPrice, tpPrice: b.tpPrice, slPrice: b.slPrice,
-        qty: b.qty, leverage: b.leverage,
-        tp: { mode: b.tpMode, tf: b.tpTf }, sl: { mode: b.slMode, tf: b.slTf },
-        openedAt: Date.now(),
+      const bot = {
+        id: ++botIdCounter,
+        config: { symbol: b.symbol, manualOnly: true, leverage: b.leverage, marginType: b.marginType, qty: b.qty,
+                  tp:{mode:b.tpMode,type:'pct',value:0,tf:b.tpTf}, sl:{mode:b.slMode,type:'pct',value:0,tf:b.slTf} },
+        activeTrade: {
+          side: b.side, entryPrice: b.entryPrice, tpPrice: b.tpPrice, slPrice: b.slPrice,
+          qty: b.qty, leverage: b.leverage,
+          tp: { mode: b.tpMode, tf: b.tpTf }, sl: { mode: b.slMode, tf: b.slTf },
+          openedAt: Date.now(),
+        },
+        lastCandleTime: null, lastTpCandle: null, lastSlCandle: null, syncCounter: 0,
       };
-      if(!botConfig) botConfig = { symbol: b.symbol, trigTf:'15m', dir:'above', triggerSource:'price', manualPrice:0, lines:[], selectedLineId:'all', qty:b.qty, leverage:b.leverage, marginType:b.marginType, tp:{mode:b.tpMode,type:'pct',value:0,tf:b.tpTf}, sl:{mode:b.slMode,type:'pct',value:0,tf:b.slTf} };
-      blog(`Manual ${b.side} opened @ ${b.entryPrice}`, 'ok');
-      return json(res,200,{success:true, orderId:r.data});
+      bots.push(bot);
+      blog(`Manual ${b.side} opened @ ${b.entryPrice} (managed as Bot #${bot.id})`, 'ok');
+      return json(res,200,{success:true, orderId:r.data, botId: bot.id});
     }
     return json(res,500,r);
   }
 
   if(url==='/trade/close' && req.method==='POST'){
-    if(!activeTrade) return json(res,400,{error:'no active trade'});
     const b = await readBody(req);
+    // Find the bot: by id if given, else first bot with an open trade
+    const bot = b.botId != null
+      ? bots.find(x => x.id === parseInt(b.botId))
+      : bots.find(x => x.activeTrade);
+    if(!bot || !bot.activeTrade) return json(res,400,{error:'no active trade'});
+
     const fraction = Math.min(1, Math.max(0, parseFloat(b.fraction)||1));
-    const symbol = botConfig ? botConfig.symbol : (b.symbol||'BTC_USDT');
+    const symbol = bot.config.symbol || b.symbol || 'BTC_USDT';
     const price = await getTicker(symbol);
 
     if(fraction >= 0.999){
-      await exitTrade('MANUAL', price || activeTrade.entryPrice);
-      return json(res,200,{closed:true, fraction:1});
+      await exitTrade(bot, 'MANUAL', price || bot.activeTrade.entryPrice);
+      return json(res,200,{closed:true, fraction:1, botId: bot.id});
     }
 
-    // Partial close
-    const closeVol = Math.max(1, Math.floor(activeTrade.qty * fraction));
-    const closeSide = activeTrade.side==='BUY' ? 4 : 2;
-    const r = await placeOrder(symbol, closeSide, closeVol, activeTrade.leverage, 1, 0, 5);
+    const closeVol = Math.max(1, Math.floor(bot.activeTrade.qty * fraction));
+    const closeSide = bot.activeTrade.side==='BUY' ? 4 : 2;
+    const r = await placeOrder(symbol, closeSide, closeVol, bot.activeTrade.leverage, 1, 0, 5);
     if(r.success){
-      activeTrade.qty -= closeVol;
-      blog(`Partial close ${Math.round(fraction*100)}% (${closeVol} contracts) @ ${price}`, 'ok');
-      if(activeTrade.qty <= 0) activeTrade = null;
-      return json(res,200,{closed:true, fraction, remaining: activeTrade ? activeTrade.qty : 0});
+      bot.activeTrade.qty -= closeVol;
+      blog(`Bot #${bot.id} partial close ${Math.round(fraction*100)}% (${closeVol} contracts) @ ${price}`, 'ok');
+      let remaining = bot.activeTrade.qty;
+      if(remaining <= 0){
+        bot.activeTrade = null; remaining = 0;
+        if(bot.config.manualOnly) bots = bots.filter(x => x.id !== bot.id);
+      }
+      return json(res,200,{closed:true, fraction, remaining, botId: bot.id});
     }
     return json(res,500,r);
   }
@@ -439,6 +711,42 @@ http.createServer(async (req, res)=>{
     return json(res,500,r);
   }
 
+  // ── AI TRADER ──
+  if(url==='/ai/start' && req.method==='POST'){
+    if(!ANTHROPIC_KEY) return json(res,400,{error:'Set ANTHROPIC_API_KEY env var in Railway first'});
+    const b = await readBody(req);
+    aiTrader.enabled = true;
+    aiTrader.symbol = b.symbol || 'BTC_USDT';
+    aiTrader.allocatedUsd = parseFloat(b.allocation) || 100;
+    aiTrader.startBalance = aiTrader.allocatedUsd + aiTrader.realizedPnl;
+    aiTrader.decisionTf = b.decisionTf || 'Min60';
+    aiTrader.lastDecisionCandle = null;
+    blog(`🧠 AI TRADER STARTED — $${aiTrader.allocatedUsd} allocation, decisions every ${aiTrader.decisionTf} candle`,'ok');
+    sendTelegram(`🧠 <b>AI Trader started</b>\nAllocation: $${aiTrader.allocatedUsd}\nDecision cadence: ${aiTrader.decisionTf}\nMax leverage: ${aiTrader.maxLeverage}x | Kill switch: -${aiTrader.killSwitchPct}%`);
+    return json(res,200,{started:true});
+  }
+
+  if(url==='/ai/stop' && req.method==='POST'){
+    aiTrader.enabled = false;
+    blog('🧠 AI Trader stopped','warn');
+    sendTelegram('🛑 <b>AI Trader stopped</b>');
+    return json(res,200,{stopped:true});
+  }
+
+  if(url==='/ai/status'){
+    return json(res,200,{
+      enabled: aiTrader.enabled,
+      hasApiKey: !!ANTHROPIC_KEY,
+      symbol: aiTrader.symbol,
+      allocation: aiTrader.allocatedUsd,
+      realizedPnl: aiTrader.realizedPnl,
+      position: aiTrader.position,
+      decisions: aiTrader.decisions.slice(-10),
+      tradeHistory: aiTrader.tradeHistory.slice(-10),
+      decisionTf: aiTrader.decisionTf,
+    });
+  }
+
   json(res,404,{error:'not found'});
 
 }).listen(PORT, ()=> {
@@ -446,4 +754,5 @@ http.createServer(async (req, res)=>{
   console.log(APP_PASSWORD ? '🔒 Password auth enabled' : '⚠️  Set APP_PASSWORD env var!');
   console.log(MEXC_KEY ? '🔑 MEXC keys loaded' : '⚠️  Set MEXC_API_KEY / MEXC_API_SECRET env vars!');
   console.log(TG_TOKEN && TG_CHAT ? '📨 Telegram alerts enabled' : 'ℹ️  Telegram off — set TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID to enable');
+  console.log(ANTHROPIC_KEY ? '🧠 AI Trader available' : 'ℹ️  AI Trader off — set ANTHROPIC_API_KEY to enable');
 });
