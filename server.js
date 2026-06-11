@@ -132,6 +132,38 @@ async function getTicker(symbol){
   return t ? parseFloat(t.lastPrice) : null;
 }
 
+// Place a stop-market order directly on MEXC (survives server restarts)
+// MEXC futures stop order: /api/v1/private/planorder/place
+// side: 1=open long, 2=close short, 3=open short, 4=close long
+// executeCycle: 1=always, triggerType: 1=mark price
+async function placeStopOrder(symbol, side, vol, triggerPrice, leverage){
+  const payload = {
+    symbol,
+    side,
+    vol,
+    leverage: leverage||1,
+    openType: 1, // isolated
+    triggerPrice,
+    executeCycle: 1,
+    orderType: 1, // market on trigger
+    trend: side===4 ? 2 : 1, // 1=price rises to trigger (for shorts), 2=price falls (for longs closing)
+  };
+  blog(`→ STOP ORDER ${JSON.stringify(payload)}`, 'info');
+  const res = await mexcRequest('POST', '/api/v1/private/planorder/place', payload);
+  blog(`← STOP ORDER RESPONSE ${JSON.stringify(res).slice(0,200)}`, res.success?'info':'err');
+  return res;
+}
+
+// Cancel a stop order by ID
+async function cancelStopOrder(symbol, orderId){
+  if(!orderId) return;
+  const res = await mexcRequest('POST', '/api/v1/private/planorder/cancel', {
+    symbol, orderId: String(orderId)
+  });
+  blog(`Cancel stop order ${orderId}: ${res.success?'✓':'✗ '+JSON.stringify(res).slice(0,100)}`, res.success?'info':'warn');
+  return res;
+}
+
 async function placeOrder(symbol, side, vol, leverage, openType, price, type){
   // side: 1=open long, 3=open short, 4=close long, 2=close short
   // type: 5=market, 1=limit
@@ -234,7 +266,15 @@ async function runBot(bot){
             if(t.breakEvenOnHit && t.slPrice !== t.entryPrice){
               t.slPrice = t.entryPrice;
               blog(`🔒 Bot #${bot.id} SL moved to break-even @ $${t.entryPrice}`, 'ok');
-              sendTelegram(`🔒 <b>Bot #${bot.id} SL → break-even</b> @ $${t.entryPrice}`);
+              // Cancel old SL order on MEXC and place new one at break-even
+              if(t.mexcSlOrderId){
+                await cancelStopOrder(cfg.symbol, t.mexcSlOrderId).catch(()=>{});
+                const closeSide = t.side==='BUY' ? 4 : 2;
+                const beRes = await placeStopOrder(cfg.symbol, closeSide, t.qty, t.entryPrice, t.leverage).catch(()=>({}));
+                t.mexcSlOrderId = beRes.success ? beRes.data : null;
+                blog(`Break-even SL on MEXC: ${beRes.success?'✓ ID:'+beRes.data:'✗ server-managed fallback'}`, beRes.success?'ok':'warn');
+              }
+              sendTelegram(`🔒 <b>Bot #${bot.id} SL → break-even</b> @ $${t.entryPrice}${t.mexcSlOrderId?' (updated on exchange ✓)':' (server-managed)'}`);
             }
             blog(`Bot #${bot.id} remaining qty: ${t.qty} — next TP: TP${i+2} at +${tpLevels[i+1]?.pct||'?'}%`, 'info');
           }
@@ -307,10 +347,24 @@ async function runBot(bot){
   if(res.success){
     bot.failCount = 0;
     blog(`✅ Bot #${bot.id} order placed! ID: ${res.data}`, 'ok');
-    sendTelegram(`✅ <b>Bot #${bot.id}: ${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${cfg.qty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}`);
+
+    // Place a REAL stop-loss order on MEXC (survives server restarts)
+    let mexcSlOrderId = null;
+    try{
+      const closeSide = side==='BUY' ? 4 : 2;
+      const slRes = await placeStopOrder(cfg.symbol, closeSide, orderQty, slPrice, cfg.leverage);
+      if(slRes.success){
+        mexcSlOrderId = slRes.data;
+        blog(`✅ Real SL order placed on MEXC @ $${slPrice} (ID: ${mexcSlOrderId})`, 'ok');
+      } else {
+        blog(`⚠️ Real SL order failed — server-managed SL fallback: ${JSON.stringify(slRes).slice(0,150)}`, 'warn');
+      }
+    }catch(e){ blog(`SL order error: ${e.message}`, 'warn'); }
+
+    sendTelegram(`✅ <b>Bot #${bot.id}: ${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${orderQty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}${mexcSlOrderId?' (real SL on exchange ✓)':' (server-managed SL fallback)'}`);
     bot.activeTrade = {
       side, entryPrice: entry,
-      tpPrice,  // compat for display
+      tpPrice,
       slPrice,
       qty: orderQty,
       leverage: cfg.leverage,
@@ -320,6 +374,7 @@ async function runBot(bot){
       activeTpCount: 0,
       tp: { mode: cfg.tp.mode, tf: cfg.tp.tf },
       sl: { mode: cfg.sl.mode, tf: cfg.sl.tf },
+      mexcSlOrderId,
       openedAt: Date.now(),
     };
     bot.lastTpCandle = null; bot.lastSlCandle = null;
@@ -338,6 +393,10 @@ async function runBot(bot){
 
 async function exitTrade(bot, reason, price, completedTps){
   const tpNote = completedTps > 0 ? ` (${completedTps} TP${completedTps>1?'s':''} already taken)` : '';
+  // Cancel the standing SL order on MEXC before closing (avoids double-close)
+  if(bot.activeTrade && bot.activeTrade.mexcSlOrderId){
+    await cancelStopOrder(bot.config.symbol, bot.activeTrade.mexcSlOrderId).catch(()=>{});
+  }
   if(!bot.activeTrade) return;
   const t = bot.activeTrade;
   const dir = t.side==='BUY'?1:-1;
