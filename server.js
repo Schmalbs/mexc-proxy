@@ -173,34 +173,78 @@ async function runBot(bot){
   // ── Manage open trade exits ──
   if(bot.activeTrade){
     const t = bot.activeTrade;
-    const price = await getTicker(cfg.symbol);
-    if(price != null){
-      if(t.tp.type==='price' || t.tp.mode==='price'){
-        const hit = t.side==='BUY' ? price >= t.tpPrice : price <= t.tpPrice;
-        if(hit) return exitTrade(bot, 'TP', price);
-      }
-      if(t.sl.mode==='price'){
-        const hit = t.side==='BUY' ? price <= t.slPrice : price >= t.slPrice;
-        if(hit) return exitTrade(bot, 'SL', price);
-      }
-    }
-    if(t.tp.mode==='candle'){
-      const c = await getLastClosedCandle(cfg.symbol, t.tp.tf);
-      if(c && c.time !== bot.lastTpCandle){
-        bot.lastTpCandle = c.time;
-        const hit = t.side==='BUY' ? c.close >= t.tpPrice : c.close <= t.tpPrice;
-        if(hit) return exitTrade(bot, 'TP (candle)', c.close);
-      }
+    const price = t.tp.mode==='price' || t.sl.mode==='price'
+      ? await getTicker(cfg.symbol) : null;
+
+    // ── STOP LOSS ──
+    if(price != null && t.sl.mode==='price'){
+      const slHit = t.side==='BUY' ? price <= t.slPrice : price >= t.slPrice;
+      if(slHit) return exitTrade(bot, 'SL', price, t.activeTpCount||0);
     }
     if(t.sl.mode==='candle'){
       const c = await getLastClosedCandle(cfg.symbol, t.sl.tf);
       if(c && c.time !== bot.lastSlCandle){
         bot.lastSlCandle = c.time;
-        const hit = t.side==='BUY' ? c.close <= t.slPrice : c.close >= t.slPrice;
-        if(hit) return exitTrade(bot, 'SL (candle)', c.close);
+        const slHit = t.side==='BUY' ? c.close <= t.slPrice : c.close >= t.slPrice;
+        if(slHit) return exitTrade(bot, 'SL (candle)', c.close, t.activeTpCount||0);
       }
     }
-    return; // trade open — this bot doesn't look for new entries
+
+    // ── MULTI-TP LEVELS ──
+    const tpLevels = t.tpLevels || [{pct: t.tpPct||2, size:100}];
+    const checkPrice = t.tp.mode==='price' ? price : null;
+    const checkCandle = t.tp.mode==='candle'
+      ? await getLastClosedCandle(cfg.symbol, t.tp.tf) : null;
+
+    let tpFired = false;
+    for(let i = (t.activeTpCount||0); i < tpLevels.length; i++){
+      const lvl = tpLevels[i];
+      const tpPrice = t.side==='BUY'
+        ? t.entryPrice * (1 + lvl.pct/100)
+        : t.entryPrice * (1 - lvl.pct/100);
+
+      let hit = false;
+      if(t.tp.mode==='price' && checkPrice != null)
+        hit = t.side==='BUY' ? checkPrice >= tpPrice : checkPrice <= tpPrice;
+      if(t.tp.mode==='candle' && checkCandle && checkCandle.time !== bot.lastTpCandle){
+        hit = t.side==='BUY' ? checkCandle.close >= tpPrice : checkCandle.close <= tpPrice;
+        if(hit) bot.lastTpCandle = checkCandle.time;
+      }
+
+      if(hit){
+        const exitVol = Math.max(1, Math.round(t.qty * lvl.size/100));
+        const isLast  = (i === tpLevels.length - 1);
+        blog(`🎯 Bot #${bot.id} TP${i+1} hit @ ${checkPrice||checkCandle?.close} | closing ${lvl.size}% (${exitVol} contracts)`, 'ok');
+        sendTelegram(`🎯 <b>Bot #${bot.id} TP${i+1} hit!</b> ${cfg.symbol}\nLevel: +${lvl.pct}% | Closing ${lvl.size}% of position\nPrice: $${checkPrice||checkCandle?.close}`);
+
+        const closeSide = t.side==='BUY' ? 4 : 2;
+        const r = await placeOrder(cfg.symbol, closeSide, exitVol, t.leverage, 1, 0, 5);
+        if(r.success){
+          t.qty -= exitVol;
+          t.activeTpCount = i + 1;
+          if(isLast || t.qty <= 0){
+            // All TPs done — trade fully closed
+            bot.activeTrade = null;
+            blog(`✅ Bot #${bot.id} all TPs complete — trade closed`, 'ok');
+            if(bot.config.manualOnly) bots = bots.filter(b=>b.id!==bot.id);
+          } else {
+            // Move SL to break-even if checkbox was set
+            if(t.breakEvenOnHit && t.slPrice !== t.entryPrice){
+              t.slPrice = t.entryPrice;
+              blog(`🔒 Bot #${bot.id} SL moved to break-even @ $${t.entryPrice}`, 'ok');
+              sendTelegram(`🔒 <b>Bot #${bot.id} SL → break-even</b> @ $${t.entryPrice}`);
+            }
+            blog(`Bot #${bot.id} remaining qty: ${t.qty} — next TP: TP${i+2} at +${tpLevels[i+1]?.pct||'?'}%`, 'info');
+          }
+          tpFired = true;
+          break; // only fire one TP level per tick
+        } else {
+          blog(`Bot #${bot.id} TP${i+1} order error: ${JSON.stringify(r).slice(0,150)}`, 'err');
+        }
+      }
+    }
+    if(tpFired) return;
+    return; // trade open — don't look for new entries
   }
 
   // Manual-trade bots only manage exits — no entry triggers
@@ -263,8 +307,15 @@ async function runBot(bot){
     blog(`✅ Bot #${bot.id} order placed! ID: ${res.data}`, 'ok');
     sendTelegram(`✅ <b>Bot #${bot.id}: ${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${cfg.qty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}`);
     bot.activeTrade = {
-      side, entryPrice: entry, tpPrice, slPrice, qty: orderQty,
+      side, entryPrice: entry,
+      tpPrice,  // compat for display
+      slPrice,
+      qty: orderQty,
       leverage: cfg.leverage,
+      tpPct: cfg.tp.value,
+      tpLevels: cfg.tp.levels || [{pct: cfg.tp.value||2, size:100}],
+      breakEvenOnHit: !!cfg.tp.breakEvenOnHit,
+      activeTpCount: 0,
       tp: { mode: cfg.tp.mode, tf: cfg.tp.tf },
       sl: { mode: cfg.sl.mode, tf: cfg.sl.tf },
       openedAt: Date.now(),
@@ -283,14 +334,15 @@ async function runBot(bot){
   }
 }
 
-async function exitTrade(bot, reason, price){
+async function exitTrade(bot, reason, price, completedTps){
+  const tpNote = completedTps > 0 ? ` (${completedTps} TP${completedTps>1?'s':''} already taken)` : '';
   if(!bot.activeTrade) return;
   const t = bot.activeTrade;
   const dir = t.side==='BUY'?1:-1;
   const pct = ((price - t.entryPrice)/t.entryPrice*100*dir*(t.leverage||1)).toFixed(2);
   blog(`🏁 Bot #${bot.id} ${reason} hit @ ${price} | P&L: ${pct>=0?'+':''}${pct}%`, pct>=0?'ok':'err');
   const emoji = pct>=0 ? '💰' : '🔻';
-  sendTelegram(`${emoji} <b>Bot #${bot.id} ${reason} — trade closed</b>\nExit: $${price}\nP&L: ${pct>=0?'+':''}${pct}%`);
+  sendTelegram(`${emoji} <b>Bot #${bot.id} ${reason} — trade closed</b>\nExit: $${price}\nP&L: ${pct>=0?'+':''}${pct}%${tpNote}`);
   const closeSide = t.side==='BUY' ? 4 : 2;
   const res = await placeOrder(bot.config.symbol, closeSide, t.qty, t.leverage, 1, 0, 5);
   if(res.success) blog(`✅ Exit order placed. ID: ${res.data}`, 'ok');
@@ -648,10 +700,12 @@ http.createServer(async (req, res)=>{
   // ── BOT ──
   if(url==='/bot/arm' && req.method==='POST'){
     const config = await readBody(req);
-    // Sanitize qty — MEXC requires integer contracts; fractional configs
-    // (from old app versions) caused infinite order-failure loops
     config.qty = Math.max(1, Math.round(parseFloat(config.qty)||1));
     config.leverage = Math.max(1, Math.min(125, parseInt(config.leverage)||1));
+    // Ensure tpLevels exists (older clients won't send it)
+    if(!config.tp) config.tp = {};
+    if(!config.tp.levels || !config.tp.levels.length)
+      config.tp.levels = [{pct: config.tp.value||2, size:100}];
     const bot = { id: ++botIdCounter, config, activeTrade: null, lastCandleTime: null, lastTpCandle: null, lastSlCandle: null, syncCounter: 0 };
     bots.push(bot);
     const srcLabel = config.triggerSource==='price' ? `price ${config.manualPrice}` : `line ${config.selectedLineId}`;
