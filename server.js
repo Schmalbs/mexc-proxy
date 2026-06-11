@@ -108,7 +108,7 @@ let botLogs      = [];    // recent log lines for client display
 function blog(msg, type=''){
   const line = { t: new Date().toISOString(), msg, type };
   botLogs.push(line);
-  if(botLogs.length > 100) botLogs.shift();
+  if(botLogs.length > 500) botLogs.shift();
   console.log(`[BOT] ${msg}`);
 }
 
@@ -135,9 +135,11 @@ async function getTicker(symbol){
 async function placeOrder(symbol, side, vol, leverage, openType, price, type){
   // side: 1=open long, 3=open short, 4=close long, 2=close short
   // type: 5=market, 1=limit
-  return mexcRequest('POST', '/api/v1/private/order/submit', {
-    symbol, price: price||0, vol, side, type: type||5, openType: openType||1, leverage: leverage||1
-  });
+  const payload = { symbol, price: price||0, vol, side, type: type||5, openType: openType||1, leverage: leverage||1 };
+  blog(`→ ORDER ${JSON.stringify(payload)}`, 'info');
+  const res = await mexcRequest('POST', '/api/v1/private/order/submit', payload);
+  blog(`← ORDER RESPONSE ${JSON.stringify(res).slice(0,300)}`, res.success?'info':'err');
+  return res;
 }
 
 async function botTick(){
@@ -249,13 +251,19 @@ async function runBot(bot){
       symbol: cfg.symbol, leverage: cfg.leverage, openType: cfg.marginType==='isolated'?1:2
     }).catch(()=>{});
   }
+  // USDT sizing: convert to integer contracts at the ACTUAL entry price
+  let orderQty = cfg.qty;
+  if(cfg.qtyUsdt && entry > 0){
+    orderQty = Math.max(1, Math.round(cfg.qtyUsdt / entry / 0.0001));
+  }
   const futSide = side==='BUY' ? 1 : 3;
-  const res = await placeOrder(cfg.symbol, futSide, cfg.qty, cfg.leverage, cfg.marginType==='isolated'?1:2, 0, 5);
+  const res = await placeOrder(cfg.symbol, futSide, orderQty, cfg.leverage, cfg.marginType==='isolated'?1:2, 0, 5);
   if(res.success){
+    bot.failCount = 0;
     blog(`✅ Bot #${bot.id} order placed! ID: ${res.data}`, 'ok');
     sendTelegram(`✅ <b>Bot #${bot.id}: ${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${cfg.qty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}`);
     bot.activeTrade = {
-      side, entryPrice: entry, tpPrice, slPrice, qty: cfg.qty,
+      side, entryPrice: entry, tpPrice, slPrice, qty: orderQty,
       leverage: cfg.leverage,
       tp: { mode: cfg.tp.mode, tf: cfg.tp.tf },
       sl: { mode: cfg.sl.mode, tf: cfg.sl.tf },
@@ -263,8 +271,15 @@ async function runBot(bot){
     };
     bot.lastTpCandle = null; bot.lastSlCandle = null;
   } else {
-    blog(`Bot #${bot.id} order error: ${JSON.stringify(res)}`, 'err');
-    sendTelegram(`❌ <b>Bot #${bot.id} order failed</b>\n${JSON.stringify(res).slice(0,200)}`);
+    bot.failCount = (bot.failCount||0) + 1;
+    blog(`Bot #${bot.id} order error (${bot.failCount}/3): ${JSON.stringify(res)}`, 'err');
+    if(bot.failCount >= 3){
+      bots = bots.filter(b => b.id !== bot.id);
+      blog(`Bot #${bot.id} AUTO-DISARMED after 3 consecutive order failures`, 'err');
+      sendTelegram(`🛑 <b>Bot #${bot.id} auto-disarmed</b> — 3 consecutive order failures.\nLast error: ${JSON.stringify(res).slice(0,150)}\nCheck qty/settings and re-arm.`);
+    } else {
+      sendTelegram(`❌ <b>Bot #${bot.id} order failed</b> (${bot.failCount}/3 before auto-disarm)\n${JSON.stringify(res).slice(0,150)}`);
+    }
   }
 }
 
@@ -633,10 +648,15 @@ http.createServer(async (req, res)=>{
   // ── BOT ──
   if(url==='/bot/arm' && req.method==='POST'){
     const config = await readBody(req);
+    // Sanitize qty — MEXC requires integer contracts; fractional configs
+    // (from old app versions) caused infinite order-failure loops
+    config.qty = Math.max(1, Math.round(parseFloat(config.qty)||1));
+    config.leverage = Math.max(1, Math.min(125, parseInt(config.leverage)||1));
     const bot = { id: ++botIdCounter, config, activeTrade: null, lastCandleTime: null, lastTpCandle: null, lastSlCandle: null, syncCounter: 0 };
     bots.push(bot);
     const srcLabel = config.triggerSource==='price' ? `price ${config.manualPrice}` : `line ${config.selectedLineId}`;
     blog(`Bot #${bot.id} ARMED — ${config.symbol} | close ${config.dir} ${srcLabel} [${config.trigTf}] | ${bots.length} bot(s) running`, 'ok');
+    blog(`Bot #${bot.id} full config: ${JSON.stringify(config)}`, 'info');
     sendTelegram(`🤖 <b>Bot #${bot.id} ARMED</b>\n${config.symbol} — candle close ${config.dir} ${srcLabel} [${config.trigTf}]\nTotal bots: ${bots.length}`);
     return json(res,200,{armed:true, id: bot.id, totalBots: bots.length});
   }
@@ -657,6 +677,15 @@ http.createServer(async (req, res)=>{
     blog(`All ${n} bot(s) DISARMED`,'warn');
     sendTelegram('🛑 <b>All bots disarmed</b>');
     return json(res,200,{armed:false, totalBots: 0});
+  }
+
+  if(url==='/logs'){
+    res.writeHead(200, {
+      'Content-Type':'text/plain; charset=utf-8',
+      'Access-Control-Allow-Origin':'*',
+      'Access-Control-Allow-Headers':'*',
+    });
+    return res.end(botLogs.map(l=>`[${l.t}] [${l.type||'info'}] ${l.msg}`).join('\n') || '(empty)');
   }
 
   if(url==='/bot/status'){
@@ -682,6 +711,7 @@ http.createServer(async (req, res)=>{
   // ── MANUAL TRADES (server-managed) ──
   if(url==='/trade/open' && req.method==='POST'){
     const b = await readBody(req);
+    b.qty = Math.max(1, Math.round(parseFloat(b.qty)||1));
     if(b.leverage > 1){
       await mexcRequest('POST','/api/v1/private/position/change_leverage',{
         symbol: b.symbol, leverage: b.leverage, openType: b.marginType==='isolated'?1:2
@@ -796,6 +826,7 @@ http.createServer(async (req, res)=>{
   json(res,404,{error:'not found'});
 
 }).listen(PORT, ()=> {
+  blog(`🔄 SERVER STARTED (all bots cleared by restart)`, 'warn');
   console.log(`MEXC Trend Trader server on :${PORT}`);
   console.log(APP_PASSWORD ? '🔒 Password auth enabled' : '⚠️  Set APP_PASSWORD env var!');
   console.log(MEXC_KEY ? '🔑 MEXC keys loaded' : '⚠️  Set MEXC_API_KEY / MEXC_API_SECRET env vars!');
