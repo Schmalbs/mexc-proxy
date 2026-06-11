@@ -735,6 +735,26 @@ http.createServer(async (req, res)=>{
     return json(res,200,{armed:false, totalBots: 0});
   }
 
+  // ── TICKER — cached 1.5s, shared across all browser tabs + bots ──
+  if(url.startsWith('/ticker')){
+    const symbol = new URL('http://x'+url).searchParams.get('symbol') || 'BTC_USDT';
+    const cacheKey = 'ticker:'+symbol;
+    const cached = mexcPublicCache.get(cacheKey);
+    if(cached && Date.now()-cached.t < 1500){
+      res.writeHead(200,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*','X-Cache':'HIT'});
+      return res.end(JSON.stringify(cached.v));
+    }
+    try{
+      const d = await mexcPublic(`/api/v1/contract/ticker?symbol=${symbol}`);
+      if(d && d.success){
+        mexcPublicCache.set(cacheKey, {t:Date.now(), v:d});
+      }
+      res.writeHead(200,{'Content-Type':'application/json','Access-Control-Allow-Origin':'*'});
+      res.end(JSON.stringify(d));
+    }catch(e){ json(res,502,{error:e.message}); }
+    return;
+  }
+
   if(url==='/logs'){
     res.writeHead(200, {
       'Content-Type':'text/plain; charset=utf-8',
