@@ -199,9 +199,11 @@ async function runBot(bot){
     let tpFired = false;
     for(let i = (t.activeTpCount||0); i < tpLevels.length; i++){
       const lvl = tpLevels[i];
-      const tpPrice = t.side==='BUY'
-        ? t.entryPrice * (1 + lvl.pct/100)
-        : t.entryPrice * (1 - lvl.pct/100);
+      const tpPrice = lvl.type==='price'
+        ? lvl.price
+        : (t.side==='BUY'
+          ? t.entryPrice * (1 + lvl.pct/100)
+          : t.entryPrice * (1 - lvl.pct/100));
 
       let hit = false;
       if(t.tp.mode==='price' && checkPrice != null)
