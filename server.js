@@ -36,6 +36,31 @@ function sendTelegram(msg){
   req.end();
 }
 
+// ── Contract discovery: real contract sizes for every MEXC futures symbol ──
+let CONTRACTS = {}; // {symbol: {contractSize, maxLeverage, displayName}}
+async function refreshContracts(){
+  try{
+    const d = await mexcPublic('/api/v1/contract/detail');
+    if(d && d.success && Array.isArray(d.data)){
+      const map = {};
+      for(const c of d.data){
+        map[c.symbol] = {
+          contractSize: parseFloat(c.contractSize)||0.0001,
+          maxLeverage: c.maxLeverage||100,
+          displayName: c.displayNameEn||c.symbol,
+        };
+      }
+      CONTRACTS = map;
+      blog(`📚 Contract list refreshed: ${Object.keys(map).length} symbols (incl. stocks/indices/metals)`,'ok');
+    }
+  }catch(e){ blog('contract refresh failed: '+e.message,'warn'); }
+}
+function contractSize(symbol){
+  return (CONTRACTS[symbol] && CONTRACTS[symbol].contractSize) || 0.0001;
+}
+refreshContracts();
+setInterval(refreshContracts, 6*3600*1000);
+
 // ── Saved chart lines (synced across devices; cleared on restart) ──
 let savedChartLines = {}; // { symbol: {lines:[...]} }
 
@@ -348,7 +373,7 @@ async function runBot(bot){
   // USDT sizing: convert to integer contracts at the ACTUAL entry price
   let orderQty = cfg.qty;
   if(cfg.qtyUsdt && entry > 0){
-    orderQty = Math.max(1, Math.round(cfg.qtyUsdt / entry / 0.0001));
+    orderQty = Math.max(1, Math.round(cfg.qtyUsdt / entry / contractSize(cfg.symbol)));
   }
   const futSide = side==='BUY' ? 1 : 3;
   const res = await placeOrder(cfg.symbol, futSide, orderQty, cfg.leverage, cfg.marginType==='isolated'?1:2, 0, 5);
@@ -592,12 +617,11 @@ Respond ONLY with JSON, no other text:
       const riskUsd = equity * Math.min(aiTrader.maxRiskPct, decision.riskPct||2)/100;
       const slDist = Math.abs(entry - decision.slPrice);
       if(slDist <= 0){ aiLog('Invalid SL distance — skipping','warn'); return; }
-      // contracts: MEXC BTC_USDT contract = 0.0001 BTC
-      const contractSize = 0.0001;
-      let qty = Math.floor(riskUsd / (slDist * contractSize));
+      const cSize = contractSize(SYMBOL);
+      let qty = Math.floor(riskUsd / (slDist * cSize));
       qty = Math.max(1, qty);
       // Cap position notional at equity * leverage
-      const maxQty = Math.floor((equity * lev) / (entry * contractSize));
+      const maxQty = Math.floor((equity * lev) / (entry * cSize));
       qty = Math.min(qty, Math.max(1, maxQty));
 
       const futSide = decision.action==='long' ? 1 : 3;
@@ -638,8 +662,7 @@ async function aiClosePosition(reason, price){
   const r = await placeOrder(aiTrader.symbol, closeSide, pos.qty, pos.leverage, 1, 0, 5);
   if(r.success){
     const dir = pos.side==='BUY'?1:-1;
-    const contractSize = 0.0001;
-    const pnl = (price - pos.entryPrice) * pos.qty * contractSize * dir;
+    const pnl = (price - pos.entryPrice) * pos.qty * contractSize(SYMBOL) * dir;
     aiTrader.realizedPnl += pnl;
     aiTrader.tradeHistory.push({ side: pos.side, entry: pos.entryPrice, exit: price, pnl, reason, t: Date.now() });
     if(aiTrader.tradeHistory.length > 50) aiTrader.tradeHistory.shift();
@@ -738,8 +761,9 @@ async function aiBotOpen(bot, side, entry, lev, tpPrice, slPrice, reasoning){
   const riskUsd = equity * bot.maxRiskPct/100;
   const slDist = Math.abs(entry - slPrice);
   if(slDist<=0) return aiBotLog(bot,'Invalid SL distance — skip','warn');
-  let qty = Math.max(1, Math.floor(riskUsd/(slDist*0.0001)));
-  const maxQty = Math.floor((equity*lev)/(entry*0.0001));
+  const cSize = contractSize(bot.symbol);
+  let qty = Math.max(1, Math.floor(riskUsd/(slDist*cSize)));
+  const maxQty = Math.floor((equity*lev)/(entry*cSize));
   qty = Math.min(qty, Math.max(1,maxQty));
 
   if(!bot.paper){
@@ -761,7 +785,7 @@ async function aiBotClose(bot, reason, price){
     if(!r.success) return aiBotLog(bot,`Close failed: ${JSON.stringify(r).slice(0,120)}`,'err');
   }
   const dir = pos.side==='BUY'?1:-1;
-  const pnl = (price-pos.entryPrice)*pos.qty*0.0001*dir;
+  const pnl = (price-pos.entryPrice)*pos.qty*contractSize(bot.symbol)*dir;
   bot.realizedPnl += pnl;
   bot.tradeHistory.push({side:pos.side, entry:pos.entryPrice, exit:price, pnl, reason, t:Date.now()});
   if(bot.tradeHistory.length>50) bot.tradeHistory.shift();
@@ -820,21 +844,17 @@ async function davidTick(){
     const closes=k.data.close.map(Number), highs=k.data.high.map(Number), lows=k.data.low.map(Number);
     const i = closes.length-1;
     const P = bot.params;
-    const emaF=calcEma(closes,P.emaFast), emaS=calcEma(closes,P.emaSlow);
-    const {adx}=calcAdx(highs,lows,closes,14);
-    const rsi=calcRsi(closes,14);
-    const atr=calcAtr(highs,lows,closes,14);
-    const price=closes[i];
+    const stratName = bot.strategy || 'trend';
+    const ctx = buildCtx({close:closes, high:highs, low:lows}, P);
+    const atr = ctx.atr;
+    const price = closes[i];
 
-    const regime = adx[i] > P.adxMin;
-    const longTrend  = emaF[i]>emaS[i] && emaF[i-1]<=emaS[i-1];
-    const shortTrend = emaF[i]<emaS[i] && emaF[i-1]>=emaS[i-1];
-    const longOk  = regime && longTrend  && rsi[i]>50 && rsi[i]<P.rsiHigh;
-    const shortOk = regime && shortTrend && rsi[i]<50 && rsi[i]>P.rsiLow;
+    const sig = STRATEGIES[stratName].signal(ctx, P, i);
+    const longOk = sig==='long', shortOk = sig==='short';
 
     bot.decisions.push({t:Date.now(), candle:price,
       action: longOk?'long':shortOk?'short':'hold',
-      reasoning:`EMA21 ${emaF[i].toFixed(0)} vs EMA55 ${emaS[i].toFixed(0)} | ADX ${adx[i].toFixed(1)} (regime ${regime?'✓':'✗'}) | RSI ${rsi[i].toFixed(1)} | ATR ${atr[i].toFixed(0)}`});
+      reasoning:`[${stratName}] ADX ${ctx.adx[i].toFixed(1)} | RSI ${ctx.rsi[i].toFixed(1)} | EMA ${ctx.emaF[i].toFixed(0)}/${ctx.emaS[i].toFixed(0)} | ATR ${atr[i].toFixed(0)}`});
     if(bot.decisions.length>50) bot.decisions.shift();
 
     if(!longOk && !shortOk) return;
@@ -942,6 +962,33 @@ setInterval(davidTick, 12000);
 setInterval(patternTick, 13000);
 
 // ═══ SELF-OPTIMIZATION: Claude + backtester loop (as in Davidd's video) ═══
+function fetchYahoo(ySymbol, interval='60m', range='730d'){
+  // Yahoo Finance unofficial chart API — free, no key. Needs a browser UA.
+  return new Promise((resolve)=>{
+    const path = `/v8/finance/chart/${encodeURIComponent(ySymbol)}?interval=${interval}&range=${range}`;
+    https.get({ hostname:'query1.finance.yahoo.com', path,
+      headers:{'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'} }, res=>{
+      let data=''; res.on('data',d=>data+=d);
+      res.on('end',()=>{
+        try{
+          const j = JSON.parse(data);
+          const r = j.chart && j.chart.result && j.chart.result[0];
+          if(!r || !r.timestamp) return resolve(null);
+          const q = r.indicators.quote[0];
+          const out = {time:[],open:[],high:[],low:[],close:[]};
+          for(let i=0;i<r.timestamp.length;i++){
+            if(q.open[i]==null||q.high[i]==null||q.low[i]==null||q.close[i]==null) continue;
+            out.time.push(r.timestamp[i]);
+            out.open.push(+q.open[i]); out.high.push(+q.high[i]);
+            out.low.push(+q.low[i]);   out.close.push(+q.close[i]);
+          }
+          resolve(out.time.length ? out : null);
+        }catch(e){ resolve(null); }
+      });
+    }).on('error',()=>resolve(null));
+  });
+}
+
 async function fetchHistory(symbol, interval, targetBars){
   // page backwards with end= to accumulate up to targetBars candles
   let all = {time:[],open:[],high:[],low:[],close:[]};
@@ -960,6 +1007,145 @@ async function fetchHistory(symbol, interval, targetBars){
     await new Promise(r=>setTimeout(r,400)); // be nice to the rate limit
   }
   return all;
+}
+
+// ── Strategy archetypes: each returns 'long' | 'short' | null at bar i ──
+// ctx = {closes, highs, lows, emaF, emaS, adx, rsi, atr, bbU, bbL, bbW, donHi, donLo}
+const STRATEGIES = {
+  trend: {
+    desc: 'EMA cross + ADX regime + RSI band',
+    params: {emaFast:[5,50], emaSlow:[20,200], adxMin:[15,40], rsiLow:[10,45], rsiHigh:[55,90], atrSL:[1,4], atrTP:[1.5,8]},
+    signal(ctx, P, i){
+      if(ctx.adx[i] <= P.adxMin) return null;
+      const xUp = ctx.emaF[i]>ctx.emaS[i] && ctx.emaF[i-1]<=ctx.emaS[i-1];
+      const xDn = ctx.emaF[i]<ctx.emaS[i] && ctx.emaF[i-1]>=ctx.emaS[i-1];
+      if(xUp && ctx.rsi[i]>50 && ctx.rsi[i]<P.rsiHigh) return 'long';
+      if(xDn && ctx.rsi[i]<50 && ctx.rsi[i]>P.rsiLow) return 'short';
+      return null;
+    },
+  },
+  donchian: {
+    desc: 'Donchian channel breakout with ADX filter',
+    params: {donLen:[10,100], adxMin:[15,40], atrSL:[1,4], atrTP:[1.5,8]},
+    signal(ctx, P, i){
+      if(ctx.adx[i] <= P.adxMin) return null;
+      if(ctx.closes[i] > ctx.donHi[i-1]) return 'long';
+      if(ctx.closes[i] < ctx.donLo[i-1]) return 'short';
+      return null;
+    },
+  },
+  meanrev: {
+    desc: 'RSI mean reversion in low-ADX chop',
+    params: {rsiOS:[10,35], rsiOB:[65,90], adxMax:[15,35], atrSL:[1,4], atrTP:[1.5,8]},
+    signal(ctx, P, i){
+      if(ctx.adx[i] >= P.adxMax) return null; // only trade chop
+      if(ctx.rsi[i-1] < P.rsiOS && ctx.rsi[i] >= P.rsiOS) return 'long';
+      if(ctx.rsi[i-1] > P.rsiOB && ctx.rsi[i] <= P.rsiOB) return 'short';
+      return null;
+    },
+  },
+  squeeze: {
+    desc: 'Bollinger squeeze → expansion breakout',
+    params: {bbLen:[10,40], bbMult:[1.5,3], squeezePct:[20,70], atrSL:[1,4], atrTP:[1.5,8]},
+    signal(ctx, P, i){
+      // squeeze: bandwidth in the lowest squeezePct% of last 100 bars, then close breaks a band
+      const lookback = 100;
+      if(i < lookback) return null;
+      const ws = [];
+      for(let j=i-lookback;j<i;j++) ws.push(ctx.bbW[j]);
+      ws.sort((a,b)=>a-b);
+      const thresh = ws[Math.floor(ws.length*P.squeezePct/100)];
+      if(ctx.bbW[i-1] > thresh) return null;
+      if(ctx.closes[i] > ctx.bbU[i]) return 'long';
+      if(ctx.closes[i] < ctx.bbL[i]) return 'short';
+      return null;
+    },
+  },
+};
+
+function buildCtx(h, P){
+  const closes=h.close, highs=h.high, lows=h.low;
+  const ctx = { closes, highs, lows,
+    emaF: calcEma(closes, P.emaFast||21), emaS: calcEma(closes, P.emaSlow||55),
+    adx: calcAdx(highs,lows,closes,14).adx,
+    rsi: calcRsi(closes,14),
+    atr: calcAtr(highs,lows,closes,14),
+  };
+  // Bollinger
+  const len = P.bbLen||20, mult = P.bbMult||2;
+  const sma = calcSma(closes,len);
+  ctx.bbU=[]; ctx.bbL=[]; ctx.bbW=[];
+  for(let i=0;i<closes.length;i++){
+    if(sma[i]==null){ ctx.bbU.push(closes[i]); ctx.bbL.push(closes[i]); ctx.bbW.push(0); continue; }
+    let v=0; for(let j=i-len+1;j<=i;j++) v+=(closes[j]-sma[i])**2;
+    const sd=Math.sqrt(v/len);
+    ctx.bbU.push(sma[i]+mult*sd); ctx.bbL.push(sma[i]-mult*sd);
+    ctx.bbW.push(sma[i]?2*mult*sd/sma[i]:0);
+  }
+  // Donchian
+  const dl = P.donLen||20;
+  ctx.donHi=[]; ctx.donLo=[];
+  for(let i=0;i<closes.length;i++){
+    const a=Math.max(0,i-dl+1);
+    let hi=-Infinity, lo=Infinity;
+    for(let j=a;j<=i;j++){ hi=Math.max(hi,highs[j]); lo=Math.min(lo,lows[j]); }
+    ctx.donHi.push(hi); ctx.donLo.push(lo);
+  }
+  return ctx;
+}
+
+function backtestStrategy(h, stratName, P, fromIdx, toIdx, recordCurve){
+  const strat = STRATEGIES[stratName] || STRATEGIES.trend;
+  const ctx = buildCtx(h, P);
+  const closes=h.close, highs=h.high, lows=h.low;
+  const FEE=0.0006, SLIP=0.0002;
+  let equity=1, peak=1, maxDd=0, wins=0, losses=0, gross=0, grossLoss=0;
+  let pos=null;
+  const curve=[];
+  const warm = Math.max(P.emaSlow||55, P.donLen||0, P.bbLen||0, 110);
+  const start = Math.max(fromIdx, warm), end = Math.min(toIdx, closes.length);
+
+  for(let i=start;i<end;i++){
+    if(pos){
+      const slHit = pos.side===1 ? lows[i]<=pos.sl : highs[i]>=pos.sl;
+      const tpHit = pos.side===1 ? highs[i]>=pos.tp : lows[i]<=pos.tp;
+      let exitPrice=null;
+      if(slHit) exitPrice=pos.sl;
+      else if(tpHit) exitPrice=pos.tp;
+      else {
+        const r1=Math.abs(pos.entry-pos.origSl);
+        if(pos.sl!==pos.entry){
+          if(pos.side===1 && highs[i]>=pos.entry+r1) pos.sl=pos.entry;
+          if(pos.side===-1 && lows[i]<=pos.entry-r1) pos.sl=pos.entry;
+        }
+      }
+      if(exitPrice!=null){
+        const ret = (exitPrice-pos.entry)/pos.entry*pos.side - FEE - SLIP;
+        equity *= (1+ret);
+        if(ret>0){ wins++; gross+=ret; } else { losses++; grossLoss+=Math.abs(ret); }
+        peak=Math.max(peak,equity); maxDd=Math.max(maxDd,(peak-equity)/peak);
+        pos=null;
+      }
+    } else {
+      const sig = strat.signal(ctx, P, i);
+      if(sig){
+        const dir = sig==='long'?1:-1;
+        pos={side:dir, entry:closes[i],
+             sl:closes[i]-dir*P.atrSL*ctx.atr[i], origSl:closes[i]-dir*P.atrSL*ctx.atr[i],
+             tp:closes[i]+dir*P.atrTP*ctx.atr[i]};
+      }
+    }
+    if(recordCurve && (i-start)%Math.max(1,Math.floor((end-start)/150))===0)
+      curve.push({i, t:h.time[i], eq:+equity.toFixed(4)});
+  }
+  const trades=wins+losses;
+  return {
+    trades, winRate: trades?+(100*wins/trades).toFixed(1):0,
+    netPct:+((equity-1)*100).toFixed(2),
+    maxDdPct:+(maxDd*100).toFixed(2),
+    profitFactor: grossLoss>0?+(gross/grossLoss).toFixed(2):(gross>0?99:0),
+    curve,
+  };
 }
 
 function backtestDavidd(h, P){
@@ -1016,65 +1202,152 @@ function backtestDavidd(h, P){
   };
 }
 
-let optimizer = { running:false, iter:0, total:0, results:[], best:null, log:[], symbol:'BTC_USDT', tf:'Min60' };
+// Wishlist: top 3 crypto + top 8 stock futures (indices + megacaps) + gold/silver/oil.
+// Each entry lists candidate MEXC symbol spellings; we use whichever actually exists.
+const MARKET_WISHLIST = [
+  {label:'BTC',     candidates:['BTC_USDT']},
+  {label:'ETH',     candidates:['ETH_USDT']},
+  {label:'SOL',     candidates:['SOL_USDT']},
+  {label:'S&P500',  candidates:['SP500_USDT','SPX500_USDT','SPX_USDT'], yahoo:'ES=F'},
+  {label:'NASDAQ',  candidates:['NAS100_USDT','NASDAQ_USDT','NDX_USDT'], yahoo:'NQ=F'},
+  {label:'DOW',     candidates:['US30_USDT','DJ30_USDT'], yahoo:'YM=F'},
+  {label:'TESLA',   candidates:['TSLA_USDT','TSLAX_USDT'], yahoo:'TSLA'},
+  {label:'NVIDIA',  candidates:['NVDA_USDT','NVDAX_USDT'], yahoo:'NVDA'},
+  {label:'APPLE',   candidates:['AAPL_USDT','AAPLX_USDT'], yahoo:'AAPL'},
+  {label:'AMD',     candidates:['AMD_USDT','AMDX_USDT'], yahoo:'AMD'},
+  {label:'MICROSOFT',candidates:['MSFT_USDT','MSFTX_USDT'], yahoo:'MSFT'},
+  {label:'GOLD',    candidates:['GOLD_USDT','XAU_USDT','XAUT_USDT','PAXG_USDT'], yahoo:'GC=F'},
+  {label:'SILVER',  candidates:['SILVER_USDT','XAG_USDT'], yahoo:'SI=F'},
+  {label:'OIL',     candidates:['OIL_USDT','USOIL_USDT','WTI_USDT','CL_USDT'], yahoo:'CL=F'},
+];
+
+function resolveMarkets(){
+  const out = [];
+  for(const w of MARKET_WISHLIST){
+    const sym = w.candidates.find(c=>CONTRACTS[c]);
+    if(sym) out.push({label:w.label, symbol:sym, yahoo:w.yahoo||null});
+  }
+  return out;
+}
+let optimizer = { running:false, iter:0, total:0, results:[], best:null, log:[], symbol:'multi', tf:'Min60' };
 
 async function runOptimizer(iterations, symbol, tf){
-  optimizer = { running:true, iter:0, total:iterations, results:[], best:null, log:[], symbol, tf };
-  blog(`🔁 OPTIMIZER started — ${iterations} iterations on ${symbol} [${tf}]`,'ok');
-  sendTelegram(`🔁 <b>Self-optimization started</b>\n${iterations} iterations, ${symbol} ${tf}`);
+  optimizer = { running:true, iter:0, total:iterations, results:[], best:null, log:[], symbol:'multi', tf };
   try{
-    const hist = await fetchHistory(symbol, tf, 6000);
-    optimizer.log.push(`History: ${hist.time.length} candles (${new Date(hist.time[0]*1000).toISOString().slice(0,10)} → now)`);
+    if(!Object.keys(CONTRACTS).length) await refreshContracts();
+    const markets = resolveMarkets();
+    if(!markets.length) throw new Error('no markets resolved from MEXC contract list');
+    optimizer.log.push(`Markets resolved on MEXC: ${markets.map(m=>`${m.label}=${m.symbol}`).join(', ')}`);
+    blog(`🔁 OPTIMIZER started — ${iterations} iters across ${markets.length} markets [${tf}]`,'ok');
+    sendTelegram(`🔁 <b>Self-optimization started</b>\n${iterations} iterations · ${markets.length} markets (crypto+indices+stocks+metals+oil) · 4 strategies · OOS validated`);
 
-    // Seed with current params
-    let current = Object.assign({}, aiBots.davidd.params);
-    let seedRes = backtestDavidd(hist, current);
-    optimizer.results.push({params:current, ...seedRes, note:'current settings'});
+    // fetch all market histories once.
+    // Crypto: MEXC (execution venue, ~11mo). Stocks/indices/metals/oil: Yahoo
+    // gives ~2 YEARS of hourly bars vs months on the newly-listed MEXC perps.
+    const hists = {};
+    const SYMBOLS = [];
+    for(const m of markets){
+      let h = null, src = 'MEXC';
+      if(m.yahoo){
+        h = await fetchYahoo(m.yahoo, '60m', '730d');
+        src = 'Yahoo:'+m.yahoo;
+        await new Promise(r=>setTimeout(r,300));
+      }
+      if(!h || h.time.length < 600){
+        const hm = await fetchHistory(m.symbol, tf, 6000);
+        if(hm.time.length > (h?h.time.length:0)){ h = hm; src = 'MEXC'; }
+      }
+      if(h && h.time.length > 600){
+        hists[m.symbol] = h; SYMBOLS.push(m.symbol);
+        optimizer.log.push(`${m.label} (${m.symbol}): ${h.time.length} bars [${src}]`);
+      } else {
+        optimizer.log.push(`${m.label} (${m.symbol}): insufficient data — skipped`);
+      }
+    }
+    if(!SYMBOLS.length) throw new Error('no usable history');
+
+    const runOOS = (sym, strat, P)=>{
+      const h = hists[sym];
+      const split = Math.floor(h.close.length*0.7);
+      const train = backtestStrategy(h, strat, P, 0, split, true);
+      const test  = backtestStrategy(h, strat, P, split, h.close.length, true);
+      return { train, test, splitTime: h.time[split] };
+    };
+
+    // Seed: current bot config on the first available market
+    const seedSym = hists['BTC_USDT'] ? 'BTC_USDT' : SYMBOLS[0];
+    const seedP = Object.assign({}, aiBots.davidd.params);
+    const seed = runOOS(seedSym,'trend',seedP);
+    optimizer.results.push({symbol:seedSym, strategy:'trend', params:seedP,
+      trainNet:seed.train.netPct, testNet:seed.test.netPct,
+      trainPf:seed.train.profitFactor, testPf:seed.test.profitFactor,
+      testDd:seed.test.maxDdPct, trades:seed.train.trades+seed.test.trades,
+      curve:[...seed.train.curve, ...seed.test.curve.map(p=>({...p, eq:+(p.eq*seed.train.curve[seed.train.curve.length-1]?.eq||1).toFixed(4)}))],
+      splitTime:seed.splitTime, note:'current settings'});
     optimizer.best = optimizer.results[0];
+
+    const stratDescs = Object.entries(STRATEGIES).map(([k,v])=>`${k}: ${v.desc} | params: ${JSON.stringify(v.params)}`).join('\n');
+    // OOS-first scoring: test segment is what matters
+    const score = r => (r.trades<30) ? -999 :
+      (r.testPf||0)*2 + (r.testNet||0)/40 - (r.testDd||0)/25 + Math.min((r.trainPf||0),3)*0.5;
 
     for(let it=1; it<=iterations && optimizer.running; it++){
       optimizer.iter = it;
       const history = optimizer.results.slice(-12).map(r=>
-        `${JSON.stringify(r.params)} → trades:${r.trades} win:${r.winRate}% net:${r.netPct}% dd:${r.maxDdPct}% pf:${r.profitFactor}`).join('\n');
+        `${r.symbol} ${r.strategy} ${JSON.stringify(r.params)} → TRAIN net:${r.trainNet}% pf:${r.trainPf} | TEST net:${r.testNet}% pf:${r.testPf} dd:${r.testDd}% (${r.trades}t)`).join('\n');
 
-      const prompt = `You are optimizing a trend strategy on ${symbol} ${tf} (EMA cross + ADX regime + RSI band + ATR exits, break-even at 1R, fees included). Search for params that maximize profit factor and net% while keeping max drawdown reasonable (<25%) and trades>=30. Param ranges: emaFast 5-50, emaSlow 20-200 (>emaFast), adxMin 15-40, rsiLow 10-45, rsiHigh 55-90, atrSL 1-4, atrTP 1.5-8.
+      const prompt = `You are searching for the most ROBUSTLY profitable crypto futures strategy. Backtests use 70% train / 30% TEST split — only TEST performance proves robustness; big train/test divergence = overfitting, avoid it.
+
+MARKETS (all live-tradeable MEXC perpetuals): ${SYMBOLS.join(', ')}
+Notes: stock/index/metal backtests use ~2yr Yahoo Finance hourly data (underlying market); execution happens on the matching MEXC perp. Session gaps exist in non-crypto data. Crypto uses MEXC's own 24/7 candles.
+STRATEGY TYPES:
+${stratDescs}
+All strategies use ATR-based SL/TP with break-even at +1R.
 
 RESULTS SO FAR:
 ${history}
 
-BEST: ${JSON.stringify(optimizer.best.params)} → net:${optimizer.best.netPct}% pf:${optimizer.best.profitFactor} dd:${optimizer.best.maxDdPct}%
+BEST SO FAR: ${optimizer.best.symbol} ${optimizer.best.strategy} ${JSON.stringify(optimizer.best.params)} → TEST net ${optimizer.best.testNet}% pf ${optimizer.best.testPf}
 
-Propose the next parameter set to test. Learn from what worked. Respond ONLY JSON:
-{"params":{"emaFast":n,"emaSlow":n,"adxMin":n,"rsiLow":n,"rsiHigh":n,"atrSL":n,"atrTP":n},"hypothesis":"one sentence"}`;
+Propose the next candidate. Explore different assets and strategy types early, refine winners later. Respond ONLY JSON:
+{"symbol":"one of the assets","strategy":"trend|donchian|meanrev|squeeze","params":{...appropriate params...},"hypothesis":"one sentence"}`;
 
-      let proposal;
+      let prop;
       try{
         const raw = await callClaude(prompt);
-        proposal = JSON.parse(raw.replace(/```json|```/g,'').trim());
-      }catch(e){
-        optimizer.log.push(`iter ${it}: Claude error — ${e.message}`);
-        continue;
-      }
-      const P = proposal.params;
-      // sanitize
-      P.emaFast=Math.max(5,Math.min(50,Math.round(P.emaFast||21)));
-      P.emaSlow=Math.max(P.emaFast+5,Math.min(200,Math.round(P.emaSlow||55)));
-      P.adxMin=Math.max(15,Math.min(40,+P.adxMin||23));
-      P.rsiLow=Math.max(10,Math.min(45,+P.rsiLow||25));
-      P.rsiHigh=Math.max(55,Math.min(90,+P.rsiHigh||75));
-      P.atrSL=Math.max(1,Math.min(4,+P.atrSL||2));
-      P.atrTP=Math.max(1.5,Math.min(8,+P.atrTP||3.5));
+        prop = JSON.parse(raw.replace(/```json|```/g,'').trim());
+      }catch(e){ optimizer.log.push(`iter ${it}: Claude error — ${e.message}`); continue; }
 
-      const resu = backtestDavidd(hist, P);
-      const entry = {params:P, ...resu, note:proposal.hypothesis};
+      const sym = SYMBOLS.includes(prop.symbol) ? prop.symbol : SYMBOLS[0];
+      const stratName = STRATEGIES[prop.strategy] ? prop.strategy : 'trend';
+      // sanitize params against the strategy's declared ranges
+      const P = {};
+      const ranges = STRATEGIES[stratName].params;
+      for(const [k,[lo,hi]] of Object.entries(ranges)){
+        let v = +((prop.params||{})[k]);
+        if(isNaN(v)) v = (lo+hi)/2;
+        P[k] = Math.max(lo, Math.min(hi, v));
+        if(['emaFast','emaSlow','donLen','bbLen'].includes(k)) P[k]=Math.round(P[k]);
+      }
+      if(P.emaSlow != null && P.emaFast != null && P.emaSlow <= P.emaFast) P.emaSlow = P.emaFast+10;
+
+      const r = runOOS(sym, stratName, P);
+      const lastTrainEq = r.train.curve.length ? r.train.curve[r.train.curve.length-1].eq : 1;
+      const entry = {
+        symbol:sym, strategy:stratName, params:P,
+        trainNet:r.train.netPct, testNet:r.test.netPct,
+        trainPf:r.train.profitFactor, testPf:r.test.profitFactor,
+        testDd:r.test.maxDdPct, trades:r.train.trades+r.test.trades,
+        curve:[...r.train.curve, ...r.test.curve.map(p=>({...p, eq:+(p.eq*lastTrainEq).toFixed(4)}))],
+        splitTime:r.splitTime, note:prop.hypothesis,
+      };
       optimizer.results.push(entry);
-      // best = highest score: pf weighted with net, penalize dd, require trades
-      const score = r => (r.trades<30||r.profitFactor<=0) ? -999 : r.profitFactor*2 + r.netPct/50 - r.maxDdPct/25;
       if(score(entry) > score(optimizer.best)) optimizer.best = entry;
-      optimizer.log.push(`iter ${it}: net ${resu.netPct}% pf ${resu.profitFactor} dd ${resu.maxDdPct}% (${resu.trades}t) — ${proposal.hypothesis}`);
+      optimizer.log.push(`iter ${it}: ${sym} ${stratName} → TEST net ${r.test.netPct}% pf ${r.test.profitFactor} (train ${r.train.netPct}%) — ${prop.hypothesis}`);
     }
-    blog(`🔁 OPTIMIZER done — best: ${JSON.stringify(optimizer.best.params)} → net ${optimizer.best.netPct}% pf ${optimizer.best.profitFactor}`,'ok');
-    sendTelegram(`✅ <b>Optimization complete</b>\nBest: net ${optimizer.best.netPct}% | PF ${optimizer.best.profitFactor} | DD ${optimizer.best.maxDdPct}%\n<code>${JSON.stringify(optimizer.best.params)}</code>\nOpen the AI page to apply.`);
+    const b = optimizer.best;
+    blog(`🔁 OPTIMIZER done — best: ${b.symbol} ${b.strategy} → TEST net ${b.testNet}% pf ${b.testPf}`,'ok');
+    sendTelegram(`✅ <b>Optimization complete</b>\nBest: ${b.symbol} <b>${b.strategy}</b>\nTRAIN net ${b.trainNet}% | TEST net ${b.testNet}% | TEST PF ${b.testPf} | DD ${b.testDd}%\n<code>${JSON.stringify(b.params)}</code>\nIf TEST ≪ TRAIN, it's overfit — don't apply.`);
   }catch(e){
     blog(`Optimizer error: ${e.message}`,'err');
     optimizer.log.push('FATAL: '+e.message);
@@ -1356,6 +1629,7 @@ http.createServer(async (req, res)=>{
       tradeHistory: bot.tradeHistory.slice(-10), decisionTf: bot.decisionTf,
       lineSource: bot.lineSource, aiSupervisor: bot.aiSupervisor,
       aiLines: bot.aiLines,
+      params: bot.params,
     });
   }
 
@@ -1373,19 +1647,25 @@ http.createServer(async (req, res)=>{
     return json(res,200,{stopped:true});
   }
   if(url==='/ai2/optimize/status'){
-    const top = optimizer.results.slice().sort((a,b)=>(b.profitFactor*2+b.netPct/50-b.maxDdPct/25)-(a.profitFactor*2+a.netPct/50-a.maxDdPct/25)).slice(0,3);
+    const sc = r => (r.trades<30) ? -999 : (r.testPf||0)*2 + (r.testNet||0)/40 - (r.testDd||0)/25 + Math.min((r.trainPf||0),3)*0.5;
+    const strip = r => { if(!r) return r; const {curve, ...rest} = r; return rest; };
+    const top = optimizer.results.slice().sort((a,b)=>sc(b)-sc(a)).slice(0,3).map(strip);
     return json(res,200,{
       running: optimizer.running, iter: optimizer.iter, total: optimizer.total,
-      best: optimizer.best, top3: top, log: optimizer.log.slice(-15),
-      currentParams: aiBots.davidd.params,
+      best: optimizer.best ? Object.assign(strip(optimizer.best), {curve: optimizer.best.curve, splitTime: optimizer.best.splitTime}) : null,
+      top3: top, log: optimizer.log.slice(-15),
+      currentParams: aiBots.davidd.params, currentStrategy: aiBots.davidd.strategy||'trend',
     });
   }
   if(url==='/ai2/optimize/apply' && req.method==='POST'){
     if(!optimizer.best) return json(res,400,{error:'no results yet'});
-    aiBots.davidd.params = Object.assign({}, optimizer.best.params);
-    blog(`✅ Applied optimized params to davidd bot: ${JSON.stringify(aiBots.davidd.params)}`,'ok');
-    sendTelegram(`✅ <b>Optimized params applied</b>\n<code>${JSON.stringify(aiBots.davidd.params)}</code>`);
-    return json(res,200,{applied:true, params: aiBots.davidd.params});
+    const b = optimizer.best;
+    aiBots.davidd.params = Object.assign({}, b.params);
+    aiBots.davidd.strategy = b.strategy || 'trend';
+    aiBots.davidd.symbol = b.symbol || 'BTC_USDT';
+    blog(`✅ Applied to davidd bot: ${b.symbol} ${b.strategy} ${JSON.stringify(b.params)}`,'ok');
+    sendTelegram(`✅ <b>Optimized strategy applied</b>\n${b.symbol} <b>${b.strategy}</b>\n<code>${JSON.stringify(b.params)}</code>`);
+    return json(res,200,{applied:true, strategy:b.strategy, symbol:b.symbol, params: aiBots.davidd.params});
   }
 
   if(url==='/logs'){
