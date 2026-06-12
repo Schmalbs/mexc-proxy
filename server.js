@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-12.22';
+const SERVER_BUILD = '2026-06-12.24';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -1794,7 +1794,7 @@ http.createServer(async (req, res)=>{
         manualPrice: b.config.manualPrice,
         selectedLineId: b.config.selectedLineId,
         // actual trigger level from the bot's SNAPSHOT (immune to chart edits)
-        phase: bot.phase||null,
+        phase: b.phase||null,
         triggerLevel: (()=>{
           try{
             if(b.config.triggerSource==='price') return parseFloat(b.config.manualPrice)||null;
