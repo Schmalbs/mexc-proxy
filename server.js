@@ -1487,6 +1487,24 @@ http.createServer(async (req, res)=>{
     return json(res,200,{armed:true, id: bot.id, totalBots: bots.length});
   }
 
+  if(url==='/bot/update' && req.method==='POST'){
+    const b = await readBody(req);
+    const bot = bots.find(x=>x.id===b.id);
+    if(!bot) return json(res,404,{error:'bot not found (server may have restarted)'});
+    if(bot.activeTrade) return json(res,409,{error:'Bot is IN A TRADE — manage the position from Open Trades instead'});
+    const config = b.cfg || {};
+    if(!config.tp) config.tp = {mode:'price', type:'pct', value:2, tf:'Min15'};
+    if(!config.tp.levels || !config.tp.levels.length)
+      config.tp.levels = [{pct: config.tp.value||2, size:100}];
+    bot.config = config;
+    bot.lastCandleTime = null; // evaluate fresh on next close
+    bot.failCount = 0;
+    blog(`✏️ Bot #${bot.id} UPDATED — ${config.dir} ${config.triggerSource==='price'?'price $'+config.manualPrice:'line '+config.selectedLineId} [${config.trigTf}]`,'ok');
+    blog(`Bot #${bot.id} new config: ${JSON.stringify(config)}`,'info');
+    sendTelegram(`✏️ <b>Bot #${bot.id} updated</b>\n${config.symbol} ${config.dir} [${config.trigTf}]`);
+    return json(res,200,{updated:true, id:bot.id});
+  }
+
   if(url==='/bot/disarm' && req.method==='POST'){
     const b = await readBody(req);
     if(b.id != null){
@@ -1703,6 +1721,7 @@ http.createServer(async (req, res)=>{
         leverage: b.config.leverage,
         qty: b.config.qty,
         activeTrade: b.activeTrade,
+        config: b.config, // full config for the edit feature
       })),
       logs: botLogs.slice(-20),
     });
