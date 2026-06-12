@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-12.20';
+const SERVER_BUILD = '2026-06-12.21';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -345,7 +345,20 @@ async function runBot(bot){
     const lines = cfg.selectedLineId==='all'
       ? cfg.lines
       : cfg.lines.filter(l => String(l.id)===String(cfg.selectedLineId));
-    for(const line of lines){
+
+    // A trend line is only valid WITHIN its drawn segment. Beyond the last
+    // drawn point, the projection would cut through unrelated S/R — so the
+    // line expires there. Horizontal lines never expire.
+    const validLines = lines.filter(l =>
+      l.isHoriz || candle.time <= Math.max(l.p1.time, l.p2.time));
+
+    if(lines.length && !validLines.length){
+      const ex = lines[0];
+      retireBot(bot, `trend line #${ex.id} segment ended (drawn until ${new Date(Math.max(ex.p1.time,ex.p2.time)*1000).toISOString().slice(0,16)}Z) — extend the line and re-arm if the level still holds`);
+      return;
+    }
+
+    for(const line of validLines){
       const lp = priceOnLine(line, candle.time);
       if((dir==='above' && candle.close > lp) || (dir==='below' && candle.close < lp)){
         triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(4)}`;
