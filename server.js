@@ -10,6 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
+const SERVER_BUILD = '2026-06-12.20';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -1479,6 +1480,7 @@ http.createServer(async (req, res)=>{
 
   // ── BOT ──
   if(url==='/bot/arm' && req.method==='POST'){
+    // (sizing preview added in arm handler below)
     const config = await readBody(req);
     config.qty = Math.max(1, Math.round(parseFloat(config.qty)||1));
     config.leverage = Math.max(1, Math.min(125, parseInt(config.leverage)||1));
@@ -1490,6 +1492,11 @@ http.createServer(async (req, res)=>{
     bots.push(bot);
     const srcLabel = config.triggerSource==='price' ? `price ${config.manualPrice}` : `line ${config.selectedLineId}`;
     blog(`Bot #${bot.id} ARMED — ${config.symbol} | close ${config.dir} ${srcLabel} [${config.trigTf}] | ${bots.length} bot(s) running`, 'ok');
+    if(config.qtyUsdt){
+      const refPx = await getTicker(config.symbol).catch(()=>null);
+      const est = refPx ? Math.round((config.qtyUsdt*(config.leverage||1))/refPx/contractSize(config.symbol)) : null;
+      blog(`Bot #${bot.id} sizing: $${config.qtyUsdt} margin × ${config.leverage}× = $${(config.qtyUsdt*(config.leverage||1)).toFixed(0)} position${est?` ≈ ${est} contracts at current price (final count converts at trigger)`:''}`,'info');
+    }
     blog(`Bot #${bot.id} full config: ${JSON.stringify(config)}`, 'info');
     sendTelegram(`🤖 <b>Bot #${bot.id} ARMED</b>\n${config.symbol} — candle close ${config.dir} ${srcLabel} [${config.trigTf}]\nTotal bots: ${bots.length}`);
     return json(res,200,{armed:true, id: bot.id, totalBots: bots.length});
@@ -1853,7 +1860,7 @@ http.createServer(async (req, res)=>{
   json(res,404,{error:'not found'});
 
 }).listen(PORT, ()=> {
-  blog(`🔄 SERVER STARTED (all bots cleared by restart)`, 'warn');
+  blog(`🔄 SERVER STARTED — build ${SERVER_BUILD} (all bots cleared by restart)`, 'warn');
   console.log(`MEXC Trend Trader server on :${PORT}`);
   console.log(APP_PASSWORD ? '🔒 Password auth enabled' : '⚠️  Set APP_PASSWORD env var!');
   console.log(MEXC_KEY ? '🔑 MEXC keys loaded' : '⚠️  Set MEXC_API_KEY / MEXC_API_SECRET env vars!');
