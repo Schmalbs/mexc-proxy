@@ -36,6 +36,9 @@ function sendTelegram(msg){
   req.end();
 }
 
+// ── Saved chart lines (synced across devices; cleared on restart) ──
+let savedChartLines = {}; // { symbol: {lines:[...]} }
+
 // ── Public data cache (3s TTL) ──
 const proxyCache = new Map();
 const mexcPublicCache = new Map();
@@ -329,8 +332,13 @@ async function runBot(bot){
   const entry = candle.close;
   const tpPrice = cfg.tp.type==='price' ? parseFloat(cfg.tp.value)
     : (side==='BUY' ? entry*(1+cfg.tp.value/100) : entry*(1-cfg.tp.value/100));
+  // SL price: exact price | % price move | % of margin (converted via leverage)
+  let slMovePct = cfg.sl.value;
+  if(cfg.sl.type==='margin'){
+    slMovePct = cfg.sl.value / (cfg.leverage||1); // 50% margin at 10x = 5% price move
+  }
   const slPrice = cfg.sl.type==='price' ? parseFloat(cfg.sl.value)
-    : (side==='BUY' ? entry*(1-cfg.sl.value/100) : entry*(1+cfg.sl.value/100));
+    : (side==='BUY' ? entry*(1-slMovePct/100) : entry*(1+slMovePct/100));
 
   if(cfg.leverage > 1){
     await mexcRequest('POST','/api/v1/private/position/change_leverage',{
@@ -812,6 +820,78 @@ http.createServer(async (req, res)=>{
       res.end(JSON.stringify(d));
     }catch(e){ json(res,502,{error:e.message}); }
     return;
+  }
+
+  // ── ADOPT an existing MEXC position into bot management ──
+  if(url==='/trade/adopt' && req.method==='POST'){
+    const b = await readBody(req);
+    const qty = Math.max(1, Math.round(parseFloat(b.qty)||1));
+    const entry = parseFloat(b.entryPrice);
+    if(!entry || !b.side) return json(res,400,{error:'entryPrice and side required'});
+
+    // Guard: refuse double-adoption of the same position (symbol + side)
+    const existing = bots.find(x => x.activeTrade &&
+      x.config.symbol === (b.symbol||'BTC_USDT') &&
+      x.activeTrade.side === b.side);
+    if(existing){
+      return json(res,409,{error:`Already managed by Bot #${existing.id}. Disarm it first to re-adopt with new settings.`});
+    }
+
+    const side = b.side; // 'BUY' | 'SELL'
+    const lev  = Math.max(1, parseInt(b.leverage)||1);
+
+    // SL price: from explicit price, % entry, or % margin
+    let slPrice = parseFloat(b.slPrice)||0;
+    if(!slPrice && b.slValue){
+      let movePct = parseFloat(b.slValue)||1;
+      if(b.slType==='margin') movePct = movePct / lev;
+      slPrice = side==='BUY' ? entry*(1-movePct/100) : entry*(1+movePct/100);
+    }
+
+    const tpLevels = (b.tpLevels && b.tpLevels.length) ? b.tpLevels : [{pct:2, size:100}];
+    const tpPrice = tpLevels[0].type==='price' ? tpLevels[0].price
+      : (side==='BUY' ? entry*(1+(tpLevels[0].pct||2)/100) : entry*(1-(tpLevels[0].pct||2)/100));
+
+    // Optionally place a real SL on MEXC
+    let mexcSlOrderId = null;
+    if(b.placeRealSl && slPrice > 0){
+      try{
+        const closeSide = side==='BUY' ? 4 : 2;
+        const slRes = await placeStopOrder(b.symbol, closeSide, qty, slPrice, lev);
+        if(slRes.success) mexcSlOrderId = slRes.data;
+      }catch(e){}
+    }
+
+    const bot = {
+      id: ++botIdCounter,
+      config: { symbol: b.symbol||'BTC_USDT', manualOnly: true, leverage: lev, marginType:'isolated', qty,
+                tp:{mode:b.tpMode||'price', type:'pct', value:tpLevels[0].pct||2, tf:b.tpTf||'Min15', levels:tpLevels, breakEvenOnHit:!!b.breakEvenOnHit},
+                sl:{mode:b.slMode||'price', type:'pct', value:b.slValue||1, tf:b.slTf||'Min15'} },
+      activeTrade: {
+        side, entryPrice: entry, tpPrice, slPrice, qty, leverage: lev,
+        tpPct: tpLevels[0].pct||2, tpLevels, breakEvenOnHit: !!b.breakEvenOnHit, activeTpCount: 0,
+        tp:{mode:b.tpMode||'price', tf:b.tpTf||'Min15'},
+        sl:{mode:b.slMode||'price', tf:b.slTf||'Min15'},
+        mexcSlOrderId,
+        openedAt: Date.now(),
+      },
+      lastCandleTime:null, lastTpCandle:null, lastSlCandle:null, syncCounter:0,
+    };
+    bots.push(bot);
+    blog(`🤝 Bot #${bot.id} ADOPTED existing ${side} position @ $${entry} (${qty} contracts, ${lev}×) | TP levels: ${JSON.stringify(tpLevels)} | SL: $${slPrice.toFixed(2)}${mexcSlOrderId?' (real SL ✓)':''}`,'ok');
+    sendTelegram(`🤝 <b>Bot #${bot.id} adopted position</b>\n${b.symbol} ${side} @ $${entry}\nQty: ${qty} | ${lev}×\nSL: $${slPrice.toFixed(2)}${mexcSlOrderId?' (on exchange ✓)':''}\nTP levels: ${tpLevels.length}`);
+    return json(res,200,{adopted:true, botId: bot.id});
+  }
+
+  // ── CHART LINE SYNC across devices ──
+  if(url==='/lines/save' && req.method==='POST'){
+    const b = await readBody(req);
+    if(b.symbol) savedChartLines[b.symbol] = b.data || {lines:[]};
+    return json(res,200,{saved:true});
+  }
+  if(url.startsWith('/lines/load')){
+    const symbol = new URL('http://x'+url).searchParams.get('symbol') || 'BTC_USDT';
+    return json(res,200, savedChartLines[symbol] || null);
   }
 
   if(url==='/logs'){
