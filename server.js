@@ -173,8 +173,8 @@ async function placeStopOrder(symbol, side, vol, triggerPrice, leverage){
     leverage: leverage||1,
     openType: 1, // isolated
     triggerPrice,
-    executeCycle: 1,
-    orderType: 1, // market on trigger
+    executeCycle: 3, // valid until cancelled (1 would expire after 24h!)
+    orderType: 5, // MARKET on trigger — orderType 1 (limit) requires a price → error 2007
     trend: side===4 ? 2 : 1, // 1=price rises to trigger (for shorts), 2=price falls (for longs closing)
   };
   blog(`→ STOP ORDER ${JSON.stringify(payload)}`, 'info');
@@ -224,8 +224,8 @@ async function runBot(bot){
          (bot.activeTrade.side==='SELL' && p.positionType===2)));
       if(!stillOpen){
         blog(`⚠️ Bot #${bot.id}: position closed externally on MEXC — clearing tracking`,'warn');
-        sendTelegram(`⚠️ <b>Bot #${bot.id}: position closed externally</b> on MEXC — tracking cleared. Bot remains armed.`);
         bot.activeTrade = null;
+        retireBot(bot, 'position closed externally on MEXC');
         return;
       }
     }
@@ -290,7 +290,7 @@ async function runBot(bot){
             // All TPs done — trade fully closed
             bot.activeTrade = null;
             blog(`✅ Bot #${bot.id} all TPs complete — trade closed`, 'ok');
-            if(bot.config.manualOnly) bots = bots.filter(b=>b.id!==bot.id);
+            retireBot(bot, 'all take-profits completed');
           } else {
             // Move SL to break-even if checkbox was set
             if(t.breakEvenOnHit && t.slPrice !== t.entryPrice){
@@ -327,6 +327,7 @@ async function runBot(bot){
   }
 
   // ── Look for entry trigger ──
+  if(bot.fired) return; // one-shot: this bot already opened its trade
   const candle = await getLastClosedCandle(cfg.symbol, cfg.trigTf);
   if(!candle || candle.time === bot.lastCandleTime) return;
   bot.lastCandleTime = candle.time;
@@ -375,12 +376,14 @@ async function runBot(bot){
   // USDT sizing: convert to integer contracts at the ACTUAL entry price
   let orderQty = cfg.qty;
   if(cfg.qtyUsdt && entry > 0){
-    orderQty = Math.max(1, Math.round(cfg.qtyUsdt / entry / contractSize(cfg.symbol)));
+    // $X at N× means: $X of YOUR margin, position notional = $X × N (like MEXC's UI)
+    orderQty = Math.max(1, Math.round((cfg.qtyUsdt * (cfg.leverage||1)) / entry / contractSize(cfg.symbol)));
   }
   const futSide = side==='BUY' ? 1 : 3;
   const res = await placeOrder(cfg.symbol, futSide, orderQty, cfg.leverage, cfg.marginType==='isolated'?1:2, 0, 5);
   if(res.success){
     bot.failCount = 0;
+    bot.fired = true; // one-shot: never trigger a second entry
     blog(`✅ Bot #${bot.id} order placed! ID: ${res.data}`, 'ok');
 
     // Place a REAL stop-loss order on MEXC (survives server restarts)
@@ -426,6 +429,12 @@ async function runBot(bot){
   }
 }
 
+function retireBot(bot, why){
+  bots = bots.filter(b => b.id !== bot.id);
+  blog(`🏁 Bot #${bot.id} RETIRED — ${why}. One-shot: it will not re-enter. Re-arm to watch again.`,'warn');
+  sendTelegram(`🏁 <b>Bot #${bot.id} retired</b> — ${why}.\nIt will NOT open another trade. Re-arm from the app if you want it watching again.`);
+}
+
 async function exitTrade(bot, reason, price, completedTps){
   const tpNote = completedTps > 0 ? ` (${completedTps} TP${completedTps>1?'s':''} already taken)` : '';
   // Cancel the standing SL order on MEXC before closing (avoids double-close)
@@ -444,8 +453,7 @@ async function exitTrade(bot, reason, price, completedTps){
   if(res.success) blog(`✅ Exit order placed. ID: ${res.data}`, 'ok');
   else blog(`Exit order error: ${JSON.stringify(res)}`, 'err');
   bot.activeTrade = null;
-  // Manual-only bots are done once their trade closes
-  if(bot.config.manualOnly) bots = bots.filter(b => b.id !== bot.id);
+  retireBot(bot, `trade closed by ${reason}`);
 }
 
 setInterval(botTick, 8000); // bot heartbeat every 8s
