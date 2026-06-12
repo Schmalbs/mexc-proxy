@@ -58,7 +58,8 @@ async function refreshContracts(){
 function contractSize(symbol){
   return (CONTRACTS[symbol] && CONTRACTS[symbol].contractSize) || 0.0001;
 }
-refreshContracts();
+// Delay first refresh until the module is fully initialized (blog/botLogs exist)
+setTimeout(refreshContracts, 2500);
 setInterval(refreshContracts, 6*3600*1000);
 
 // ── Saved chart lines (synced across devices; cleared on restart) ──
