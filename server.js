@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-12.21';
+const SERVER_BUILD = '2026-06-12.22';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -152,7 +152,8 @@ async function getLastClosedCandle(symbol, interval){
   const d = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${interval}&limit=3`);
   if(!d || !d.success || !d.data || !d.data.time || d.data.time.length < 2) return null;
   const i = d.data.time.length - 2;
-  return { time: parseInt(d.data.time[i]), close: parseFloat(d.data.close[i]) };
+  return { time: parseInt(d.data.time[i]), close: parseFloat(d.data.close[i]),
+           high: parseFloat(d.data.high[i]), low: parseFloat(d.data.low[i]) };
 }
 
 async function getTicker(symbol){
@@ -367,7 +368,62 @@ async function runBot(bot){
     }
   }
 
-  if(!triggered) return;
+  // ── BREAK + RETEST CONFIRMATION (optional) ──
+  if(cfg.retestConfirm){
+    const TOL = 0.001; // 0.1% touch tolerance toward the line
+
+    if(bot.phase === 'retest'){
+      // We are past the break — judge this candle against the broken line
+      const line = cfg.triggerSource==='price'
+        ? {id:'price', isHoriz:true, horizPrice: parseFloat(cfg.manualPrice)}
+        : (cfg.lines||[]).find(l => l.id === bot.retestLineId);
+      if(!line){ retireBot(bot, 'retest line vanished from snapshot'); return; }
+      if(!line.isHoriz && candle.time > Math.max(line.p1.time, line.p2.time)){
+        retireBot(bot, `trend line #${line.id} segment ended while awaiting retest`);
+        return;
+      }
+      const lp = priceOnLine(line, candle.time);
+
+      if(dir==='above'){ // broke resistance — needs retest as SUPPORT
+        if(candle.close < lp){
+          bot.phase = null; bot.retestLineId = null;
+          blog(`↩️ Bot #${bot.id} breakout FAILED (closed back below line @ ${lp.toFixed(2)}) — watching for the next break`,'warn');
+          sendTelegram(`↩️ <b>Bot #${bot.id} breakout failed</b> — candle closed back below the line. No trade. Watching for the next break.`);
+          return;
+        }
+        if(candle.low <= lp*(1+TOL) && candle.close > lp){
+          blog(`✅ Bot #${bot.id} RETEST HELD — wick touched ${lp.toFixed(2)}, closed above @ ${candle.close}`,'ok');
+          // fall through to entry below
+        } else return; // still waiting for the touch
+      } else { // broke support — needs retest as RESISTANCE
+        if(candle.close > lp){
+          bot.phase = null; bot.retestLineId = null;
+          blog(`↩️ Bot #${bot.id} breakdown FAILED (closed back above line @ ${lp.toFixed(2)}) — watching for the next break`,'warn');
+          sendTelegram(`↩️ <b>Bot #${bot.id} breakdown failed</b> — candle closed back above the line. No trade. Watching for the next break.`);
+          return;
+        }
+        if(candle.high >= lp*(1-TOL) && candle.close < lp){
+          blog(`✅ Bot #${bot.id} RETEST HELD — wick touched ${lp.toFixed(2)}, closed below @ ${candle.close}`,'ok');
+        } else return;
+      }
+      triggerLabel = `break+retest of ${triggerLabel||('line #'+bot.retestLineId)}`;
+      // confirmed → continue into the entry code below
+
+    } else {
+      // No break seen yet — a trigger here is the BREAK, not the entry
+      if(!triggered) return;
+      const m = triggerLabel.match(/line #(\d+)/);
+      bot.retestLineId = cfg.triggerSource==='price' ? 'price'
+        : (m ? parseInt(m[1]) : (cfg.lines&&cfg.lines[0]&&cfg.lines[0].id));
+      bot.phase = 'retest';
+      blog(`🔔 Bot #${bot.id} BREAK detected ${dir} ${triggerLabel} @ ${candle.close} — awaiting retest before entry`,'ok');
+      sendTelegram(`🔔 <b>Bot #${bot.id} break detected</b>\n${cfg.symbol} closed ${dir} ${triggerLabel}\n⏳ Waiting for a retest that holds before entering.`);
+      return;
+    }
+  } else {
+    if(!triggered) return;
+  }
+
   blog(`🔔 Bot #${bot.id} trigger! Candle closed ${dir} ${triggerLabel} @ ${candle.close}`, 'ok');
   sendTelegram(`🔔 <b>Bot #${bot.id} trigger fired!</b>\n${cfg.symbol} candle closed ${dir} ${triggerLabel}\nClose: $${candle.close}`);
 
@@ -1527,6 +1583,7 @@ http.createServer(async (req, res)=>{
     bot.config = config;
     bot.lastCandleTime = null; // evaluate fresh on next close
     bot.failCount = 0;
+    bot.phase = null; bot.retestLineId = null; // edited config restarts the cycle
     blog(`✏️ Bot #${bot.id} UPDATED — ${config.dir} ${config.triggerSource==='price'?'price $'+config.manualPrice:'line '+config.selectedLineId} [${config.trigTf}]`,'ok');
     blog(`Bot #${bot.id} new config: ${JSON.stringify(config)}`,'info');
     sendTelegram(`✏️ <b>Bot #${bot.id} updated</b>\n${config.symbol} ${config.dir} [${config.trigTf}]`);
@@ -1737,6 +1794,7 @@ http.createServer(async (req, res)=>{
         manualPrice: b.config.manualPrice,
         selectedLineId: b.config.selectedLineId,
         // actual trigger level from the bot's SNAPSHOT (immune to chart edits)
+        phase: bot.phase||null,
         triggerLevel: (()=>{
           try{
             if(b.config.triggerSource==='price') return parseFloat(b.config.manualPrice)||null;
