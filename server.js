@@ -278,7 +278,8 @@ async function runBot(bot){
         const exitVol = Math.max(1, Math.round(t.qty * lvl.size/100));
         const isLast  = (i === tpLevels.length - 1);
         blog(`🎯 Bot #${bot.id} TP${i+1} hit @ ${checkPrice||checkCandle?.close} | closing ${lvl.size}% (${exitVol} contracts)`, 'ok');
-        sendTelegram(`🎯 <b>Bot #${bot.id} TP${i+1} hit!</b> ${cfg.symbol}\nLevel: +${lvl.pct}% | Closing ${lvl.size}% of position\nPrice: $${checkPrice||checkCandle?.close}`);
+        const lvlLabel = lvl.type==='price' ? `$${lvl.price}` : `+${lvl.pct}%`;
+        sendTelegram(`🎯 <b>Bot #${bot.id} TP${i+1} hit!</b> ${cfg.symbol}\nLevel: ${lvlLabel} | Closing ${lvl.size}% of position\nPrice: $${checkPrice||checkCandle?.close}`);
 
         const closeSide = t.side==='BUY' ? 4 : 2;
         const r = await placeOrder(cfg.symbol, closeSide, exitVol, t.leverage, 1, 0, 5);
@@ -1689,6 +1690,15 @@ http.createServer(async (req, res)=>{
         triggerSource: b.config.triggerSource,
         manualPrice: b.config.manualPrice,
         selectedLineId: b.config.selectedLineId,
+        // actual trigger level from the bot's SNAPSHOT (immune to chart edits)
+        triggerLevel: (()=>{
+          try{
+            if(b.config.triggerSource==='price') return parseFloat(b.config.manualPrice)||null;
+            const ln = (b.config.lines||[]).find(l=>String(l.id)===String(b.config.selectedLineId));
+            if(!ln) return null;
+            return ln.isHoriz ? ln.horizPrice : null; // trend lines: level varies by candle
+          }catch(e){ return null; }
+        })(),
         manualOnly: !!b.config.manualOnly,
         leverage: b.config.leverage,
         qty: b.config.qty,
