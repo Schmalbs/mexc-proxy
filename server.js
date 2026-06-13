@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.48';
+const SERVER_BUILD = '2026-06-13.50';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -41,6 +41,7 @@ function saveState(){
         } : null,
         patternJournal,
         savedChartLines,
+        sentimentCache,
       };
       fs.writeFileSync(STATE_FILE, JSON.stringify(state));
     }catch(e){ console.log('[STATE] save failed:', e.message); }
@@ -645,6 +646,43 @@ function callClaude(prompt){
     req.write(body); req.end();
   });
 }
+
+// Claude with the web_search tool enabled — for live sentiment gathering.
+// Returns the full concatenated text of the response (Claude searches, reads, summarizes).
+function callClaudeWithSearch(prompt, maxTokens){
+  return new Promise((resolve, reject)=>{
+    const body = JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens||1500,
+      messages: [{ role:'user', content: prompt }],
+      tools: [{ type:'web_search_20250305', name:'web_search', max_uses: 6 }],
+    });
+    const req = https.request({
+      hostname: 'api.anthropic.com', path: '/v1/messages', method: 'POST',
+      headers: {
+        'x-api-key': ANTHROPIC_KEY,
+        'anthropic-version': '2023-06-01',
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      }
+    }, res=>{
+      let data=''; res.on('data',d=>data+=d);
+      res.on('end',()=>{
+        try{
+          const j = JSON.parse(data);
+          if(j.error) return reject(new Error(j.error.message||'API error'));
+          const text = (j.content||[]).map(b=> b.type==='text' ? b.text : '').join('');
+          resolve(text);
+        }catch(e){ reject(new Error('parse error: '+data.slice(0,200))); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body); req.end();
+  });
+}
+
+// Cache the last sentiment read so repeated opens don't re-spend until refreshed
+let sentimentCache = { text:null, at:0 };
 
 
 
@@ -1446,6 +1484,44 @@ http.createServer(async (req, res)=>{
     saveState();
     return json(res,200,{closed:true});
   }
+  // ── SENTIMENT ──
+  if(url==='/sentiment/get'){
+    // return cached read without spending anything
+    return json(res,200,{ text: sentimentCache.text, at: sentimentCache.at });
+  }
+  if(url==='/sentiment/refresh' && req.method==='POST'){
+    if(!ANTHROPIC_KEY) return json(res,400,{error:'needs ANTHROPIC_API_KEY'});
+    const prompt = `Search the web for the most recent (last 1-2 weeks) Bitcoin/crypto outlook from each of these analysts INDIVIDUALLY, searching each by name separately so you get a distinct read on each one:
+- Benjamin Cowen (Into The Cryptoverse)
+- MMCrypto
+- DAAN Crypto Trader (daax)
+- Gareth Soloway
+Also check Google Trends interest for "Bitcoin" as a gauge of general retail attention.
+
+Give a SEPARATE read for each person so the trader can weight them himself. Use EXACTLY this format with these markers:
+
+[OVERALL] <BULLISH / BEARISH / NEUTRAL / MIXED> — <confidence low/med/high>, one line on the spread of views
+
+[COWEN] <BULLISH/BEARISH/NEUTRAL/UNCERTAIN/NO RECENT READ> — 1-2 sentences, paraphrased, why
+[MMCRYPTO] <leaning> — 1-2 sentences
+[DAAX] <leaning> — 1-2 sentences
+[SOLOWAY] <leaning> — 1-2 sentences
+
+[COMMUNITY] <what Google Trends / general attention suggests — heating up, cooling, apathetic, euphoric>
+
+[CONTRARIAN] <one sentence — if views are lopsided, flag that extremes often precede reversals>
+
+Rules: paraphrase everything in your own words, never quote them directly. If you can't find recent info on someone, put "NO RECENT READ" for them rather than guessing. Keep each block tight.`;
+    try{
+      const text = await callClaudeWithSearch(prompt, 1600);
+      sentimentCache = { text, at: Date.now() };
+      saveState();
+      return json(res,200,{ text, at: sentimentCache.at });
+    }catch(e){
+      return json(res,500,{error:'sentiment failed: '+e.message});
+    }
+  }
+
   // ── JOURNAL CRUD (mirrored to client localStorage) ──
   if(url==='/ai2/pattern/journal' && req.method==='GET' || url==='/ai2/pattern/journal/list'){
     return json(res,200,{journal: patternJournal});
@@ -1674,6 +1750,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
       if(st.botIdCounter) botIdCounter = st.botIdCounter;
       if(st.patternJournal) patternJournal = st.patternJournal;
       if(st.savedChartLines) savedChartLines = st.savedChartLines;
+      if(st.sentimentCache) sentimentCache = st.sentimentCache;
       if(st.patternBot && aiBots.pattern) Object.assign(aiBots.pattern, st.patternBot);
       const openTrades = bots.filter(b=>b.activeTrade).length + (aiBots.pattern&&aiBots.pattern.position?1:0);
       blog(`🔄 SERVER STARTED — build ${SERVER_BUILD} — RESTORED ${bots.length} bot(s), ${openTrades} open trade(s), ${patternJournal.length} journal entries from volume`, 'ok');
