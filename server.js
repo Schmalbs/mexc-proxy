@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.38';
+const SERVER_BUILD = '2026-06-13.39';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -910,7 +910,13 @@ function aiBotKillCheck(bot){
 // ── DAVIDD BOT: EMA cross + ADX regime + RSI confirm + ATR risk ──
 async function patternTick(){
   const bot = aiBots.pattern;
-  if(!bot.enabled || !ANTHROPIC_KEY) return;
+  // SAFETY: if a position is open, keep managing its TP/SL even when the bot is
+  // stopped — a held trade must never go unmanaged just because entries are off.
+  if(!bot.enabled){
+    if(bot.position){ try{ await aiBotManageExits(bot); }catch(e){} }
+    return;
+  }
+  if(!ANTHROPIC_KEY) return;
   try{
     if(aiBotKillCheck(bot)) return;
     if(await aiBotManageExits(bot)) return;
@@ -1349,7 +1355,15 @@ http.createServer(async (req, res)=>{
   if(url==='/ai2/pattern/stop' && req.method==='POST'){
     aiBots.pattern.enabled = false;
     blog(`🧠 PATTERN bot stopped`,'warn');
+    saveState();
     return json(res,200,{stopped:true});
+  }
+  if(url==='/ai2/pattern/close' && req.method==='POST'){
+    const bot = aiBots.pattern;
+    if(!bot.position) return json(res,400,{error:'no open position'});
+    await aiBotClose(bot, 'manual close from app');
+    saveState();
+    return json(res,200,{closed:true});
   }
   // ── JOURNAL CRUD (mirrored to client localStorage) ──
   if(url==='/ai2/pattern/journal' && req.method==='GET' || url==='/ai2/pattern/journal/list'){
