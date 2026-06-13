@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-12.24';
+const SERVER_BUILD = '2026-06-12.28';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -923,18 +923,38 @@ async function davidTick(){
     if(!k || !k.success) return;
     const closes=k.data.close.map(Number), highs=k.data.high.map(Number), lows=k.data.low.map(Number);
     const i = closes.length-1;
-    const P = bot.params;
-    const stratName = bot.strategy || 'trend';
-    const ctx = buildCtx({close:closes, high:highs, low:lows}, P);
-    const atr = ctx.atr;
     const price = closes[i];
 
+    // ── REGIME DETECTION (live): same 200-EMA slope rule as the backtester ──
+    const phaseSeries = marketPhaseSeries(closes);
+    const regime = phaseSeries[i] || 'chop';
+
+    // Pick strategy + params for THIS regime. If a regimeMap is set, use it;
+    // otherwise fall back to the single configured strategy (legacy behaviour).
+    let stratName, P;
+    if(bot.regimeMap && bot.regimeMap[regime]){
+      stratName = bot.regimeMap[regime].strategy;
+      P = bot.regimeMap[regime].params;
+    } else if(bot.regimeMap){
+      // adaptive mode but this regime deliberately unassigned → stay flat
+      bot.decisions.push({t:Date.now(), candle:price, action:'hold',
+        reasoning:`[adaptive] ${regime.toUpperCase()} regime — no strategy assigned, staying flat`});
+      if(bot.decisions.length>50) bot.decisions.shift();
+      return;
+    } else {
+      stratName = bot.strategy || 'trend';
+      P = bot.params;
+    }
+
+    const ctx = buildCtx({close:closes, high:highs, low:lows}, P);
+    const atr = ctx.atr;
     const sig = STRATEGIES[stratName].signal(ctx, P, i);
     const longOk = sig==='long', shortOk = sig==='short';
 
+    const regimeTag = bot.regimeMap ? `${regime.toUpperCase()}→${stratName}` : stratName;
     bot.decisions.push({t:Date.now(), candle:price,
       action: longOk?'long':shortOk?'short':'hold',
-      reasoning:`[${stratName}] ADX ${ctx.adx[i].toFixed(1)} | RSI ${ctx.rsi[i].toFixed(1)} | EMA ${ctx.emaF[i].toFixed(0)}/${ctx.emaS[i].toFixed(0)} | ATR ${atr[i].toFixed(0)}`});
+      reasoning:`[${regimeTag}] ADX ${ctx.adx[i].toFixed(1)} | RSI ${ctx.rsi[i].toFixed(1)} | EMA ${ctx.emaF[i].toFixed(0)}/${ctx.emaS[i].toFixed(0)} | ATR ${atr[i].toFixed(0)}`});
     if(bot.decisions.length>50) bot.decisions.shift();
 
     if(!longOk && !shortOk) return;
@@ -1174,14 +1194,28 @@ function buildCtx(h, P){
   return ctx;
 }
 
+// Regime tag from a 200-bar EMA slope (normalized %/bar): bull / bear / chop.
+function marketPhaseSeries(closes){
+  const ema = calcEma(closes, 200);
+  const phase = new Array(closes.length).fill('chop');
+  for(let i=1;i<closes.length;i++){
+    const slopePct = (ema[i]-ema[i-1])/(ema[i-1]||1)*100;
+    // ~0.02%/hr ≈ ~3.5%/week trend threshold
+    phase[i] = slopePct > 0.02 ? 'bull' : slopePct < -0.02 ? 'bear' : 'chop';
+  }
+  return phase;
+}
+
 function backtestStrategy(h, stratName, P, fromIdx, toIdx, recordCurve){
   const strat = STRATEGIES[stratName] || STRATEGIES.trend;
   const ctx = buildCtx(h, P);
   const closes=h.close, highs=h.high, lows=h.low;
+  const phaseSeries = recordCurve ? marketPhaseSeries(closes) : null;
   const FEE=0.0006, SLIP=0.0002;
   let equity=1, peak=1, maxDd=0, wins=0, losses=0, gross=0, grossLoss=0;
   let pos=null;
   const curve=[];
+  const phaseTrades = recordCurve ? {bull:{w:0,l:0,net:0}, bear:{w:0,l:0,net:0}, chop:{w:0,l:0,net:0}} : null;
   const warm = Math.max(P.emaSlow||55, P.donLen||0, P.bbLen||0, 110);
   const start = Math.max(fromIdx, warm), end = Math.min(toIdx, closes.length);
 
@@ -1203,6 +1237,7 @@ function backtestStrategy(h, stratName, P, fromIdx, toIdx, recordCurve){
         const ret = (exitPrice-pos.entry)/pos.entry*pos.side - FEE - SLIP;
         equity *= (1+ret);
         if(ret>0){ wins++; gross+=ret; } else { losses++; grossLoss+=Math.abs(ret); }
+        if(recordCurve){ const ph=(phaseSeries[pos.entryIdx]||'chop'); const pt=phaseTrades[ph]; if(ret>0)pt.w++;else pt.l++; pt.net+=ret; }
         peak=Math.max(peak,equity); maxDd=Math.max(maxDd,(peak-equity)/peak);
         pos=null;
       }
@@ -1210,21 +1245,30 @@ function backtestStrategy(h, stratName, P, fromIdx, toIdx, recordCurve){
       const sig = strat.signal(ctx, P, i);
       if(sig){
         const dir = sig==='long'?1:-1;
-        pos={side:dir, entry:closes[i],
+        pos={side:dir, entry:closes[i], entryIdx:i,
              sl:closes[i]-dir*P.atrSL*ctx.atr[i], origSl:closes[i]-dir*P.atrSL*ctx.atr[i],
              tp:closes[i]+dir*P.atrTP*ctx.atr[i]};
       }
     }
     if(recordCurve && (i-start)%Math.max(1,Math.floor((end-start)/150))===0)
-      curve.push({i, t:h.time[i], eq:+equity.toFixed(4)});
+      curve.push({i, t:h.time[i], eq:+equity.toFixed(4), phase:phaseSeries[i]});
   }
   const trades=wins+losses;
+  // Per-phase trade outcome split (only meaningful when curve recorded)
+  let phaseBreakdown = null;
+  if(recordCurve && phaseTrades){
+    phaseBreakdown = {};
+    for(const ph of ['bull','bear','chop']){
+      const pt = phaseTrades[ph];
+      phaseBreakdown[ph] = { trades: pt.w+pt.l, winRate: (pt.w+pt.l)?+(100*pt.w/(pt.w+pt.l)).toFixed(1):0, netPct:+(pt.net*100).toFixed(2) };
+    }
+  }
   return {
     trades, winRate: trades?+(100*wins/trades).toFixed(1):0,
     netPct:+((equity-1)*100).toFixed(2),
     maxDdPct:+(maxDd*100).toFixed(2),
     profitFactor: grossLoss>0?+(gross/grossLoss).toFixed(2):(gross>0?99:0),
-    curve,
+    curve, phaseBreakdown,
   };
 }
 
@@ -1363,7 +1407,7 @@ async function runOptimizer(iterations, symbol, tf){
       trainPf:seed.train.profitFactor, testPf:seed.test.profitFactor,
       testDd:seed.test.maxDdPct, trades:seed.train.trades+seed.test.trades,
       curve:[...seed.train.curve, ...seed.test.curve.map(p=>({...p, eq:+(p.eq*seed.train.curve[seed.train.curve.length-1]?.eq||1).toFixed(4)}))],
-      splitTime:seed.splitTime, note:'current settings'});
+      splitTime:seed.splitTime, note:'current settings', phaseBreakdown: seed.test.phaseBreakdown});
     optimizer.best = optimizer.results[0];
 
     const stratDescs = Object.entries(STRATEGIES).map(([k,v])=>`${k}: ${v.desc} | params: ${JSON.stringify(v.params)}`).join('\n');
@@ -1420,6 +1464,7 @@ Propose the next candidate. Explore different assets and strategy types early, r
         testDd:r.test.maxDdPct, trades:r.train.trades+r.test.trades,
         curve:[...r.train.curve, ...r.test.curve.map(p=>({...p, eq:+(p.eq*lastTrainEq).toFixed(4)}))],
         splitTime:r.splitTime, note:prop.hypothesis,
+        phaseBreakdown: r.test.phaseBreakdown, // bull/bear/chop on the out-of-sample segment
       };
       optimizer.results.push(entry);
       if(score(entry) > score(optimizer.best)) optimizer.best = entry;
@@ -1433,6 +1478,28 @@ Propose the next candidate. Explore different assets and strategy types early, r
     optimizer.log.push('FATAL: '+e.message);
   }
   optimizer.running=false;
+}
+
+// For each regime, pick the result with the best OOS net% IN THAT REGIME
+// (requiring a minimum number of in-regime trades so it isn't noise).
+function buildRegimeMap(){
+  const out = { bull:null, bear:null, chop:null };
+  const best = { bull:-1e9, bear:-1e9, chop:-1e9 };
+  for(const r of optimizer.results){
+    const pb = r.phaseBreakdown;
+    if(!pb) continue;
+    for(const regime of ['bull','bear','chop']){
+      const seg = pb[regime];
+      if(!seg || seg.trades < 8) continue;       // need real activity in-regime
+      if(seg.netPct <= 0) continue;              // must be profitable in-regime
+      if(seg.netPct > best[regime]){
+        best[regime] = seg.netPct;
+        out[regime] = { strategy:r.strategy, params:r.params, symbol:r.symbol,
+                        regimeNet:seg.netPct, regimeWin:seg.winRate, regimeTrades:seg.trades };
+      }
+    }
+  }
+  return out;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1735,6 +1802,8 @@ http.createServer(async (req, res)=>{
       lineSource: bot.lineSource, aiSupervisor: bot.aiSupervisor,
       aiLines: bot.aiLines,
       params: bot.params,
+      strategy: bot.strategy||'trend',
+      regimeMap: bot.regimeMap||null,
     });
   }
 
@@ -1760,6 +1829,7 @@ http.createServer(async (req, res)=>{
       best: optimizer.best ? Object.assign(strip(optimizer.best), {curve: optimizer.best.curve, splitTime: optimizer.best.splitTime}) : null,
       top3: top, log: optimizer.log.slice(-15),
       currentParams: aiBots.davidd.params, currentStrategy: aiBots.davidd.strategy||'trend',
+      regimeMap: buildRegimeMap(), activeRegimeMap: aiBots.davidd.regimeMap||null,
     });
   }
   if(url==='/ai2/optimize/apply' && req.method==='POST'){
@@ -1768,9 +1838,22 @@ http.createServer(async (req, res)=>{
     aiBots.davidd.params = Object.assign({}, b.params);
     aiBots.davidd.strategy = b.strategy || 'trend';
     aiBots.davidd.symbol = b.symbol || 'BTC_USDT';
-    blog(`✅ Applied to davidd bot: ${b.symbol} ${b.strategy} ${JSON.stringify(b.params)}`,'ok');
+    aiBots.davidd.regimeMap = null; // single-strategy mode
+    blog(`✅ Applied (single strategy) to davidd: ${b.symbol} ${b.strategy} ${JSON.stringify(b.params)}`,'ok');
     sendTelegram(`✅ <b>Optimized strategy applied</b>\n${b.symbol} <b>${b.strategy}</b>\n<code>${JSON.stringify(b.params)}</code>`);
     return json(res,200,{applied:true, strategy:b.strategy, symbol:b.symbol, params: aiBots.davidd.params});
+  }
+  if(url==='/ai2/optimize/apply-regime' && req.method==='POST'){
+    const map = buildRegimeMap();
+    if(!map || (!map.bull && !map.bear && !map.chop)) return json(res,400,{error:'not enough regime data yet — run more iterations'});
+    aiBots.davidd.regimeMap = map;
+    // symbol: use the bull pick's symbol (or any assigned), bot trades one symbol
+    const anySym = (map.bull||map.bear||map.chop).symbol;
+    aiBots.davidd.symbol = anySym;
+    const summary = ['bull','bear','chop'].map(r=>map[r]?`${r}→${map[r].strategy}`:`${r}→flat`).join(', ');
+    blog(`✅ Applied REGIME MAP to davidd (${anySym}): ${summary}`,'ok');
+    sendTelegram(`✅ <b>Adaptive regime map applied</b>\n${anySym}\n${summary}\n<i>Bot switches strategy by live 200-EMA regime.</i>`);
+    return json(res,200,{applied:true, symbol:anySym, regimeMap:map});
   }
 
   if(url==='/logs'){
