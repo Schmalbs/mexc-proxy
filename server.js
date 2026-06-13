@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.45';
+const SERVER_BUILD = '2026-06-13.47';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -866,8 +866,17 @@ async function aiBotClose(bot, reason, price){
   const dir = pos.side==='BUY'?1:-1;
   const pnl = (price-pos.entryPrice)*pos.qty*contractSize(bot.symbol)*dir;
   bot.realizedPnl += pnl;
-  bot.tradeHistory.push({side:pos.side, entry:pos.entryPrice, exit:price, pnl, reason, t:Date.now()});
-  if(bot.tradeHistory.length>50) bot.tradeHistory.shift();
+  // Risk/reward metrics: planned R:R from entry/SL/TP, and realized R (actual move ÷ planned risk)
+  const riskDist = pos.slPrice ? Math.abs(pos.entryPrice - pos.slPrice) : null;
+  const rewardDist = pos.tpPrice ? Math.abs(pos.tpPrice - pos.entryPrice) : null;
+  const plannedRR = (riskDist && rewardDist) ? +(rewardDist/riskDist).toFixed(2) : null;
+  const realizedR = riskDist ? +(((price-pos.entryPrice)*dir)/riskDist).toFixed(2) : null;
+  bot.tradeHistory.push({
+    side:pos.side, entry:pos.entryPrice, exit:price, pnl, reason, t:Date.now(),
+    sl:pos.slPrice||null, tp:pos.tpPrice||null, qty:pos.qty, leverage:pos.leverage,
+    openedAt: pos.openedAt||null, plannedRR, realizedR, paper: bot.paper,
+  });
+  if(bot.tradeHistory.length>200) bot.tradeHistory.shift();
   const emoji = pnl>=0?'💰':'🔻';
   aiBotLog(bot, `${emoji} ${reason}: ${pos.side} closed @ $${price} | ${pnl>=0?'+':''}$${pnl.toFixed(2)} | total ${bot.realizedPnl>=0?'+':''}$${bot.realizedPnl.toFixed(2)}`, pnl>=0?'ok':'err');
   sendTelegram(`${emoji} <b>[${bot.name.toUpperCase()}] closed ${pos.side}</b> (${reason})\nExit $${price} | P&L ${pnl>=0?'+':''}$${pnl.toFixed(2)}\nBot total: ${bot.realizedPnl>=0?'+':''}$${bot.realizedPnl.toFixed(2)} ${bot.paper?'(paper)':''}`);
@@ -919,11 +928,15 @@ async function patternTick(){
   if(!ANTHROPIC_KEY) return;
   try{
     if(aiBotKillCheck(bot)) return;
-    if(await aiBotManageExits(bot)) return;
+    if(await aiBotManageExits(bot)) return; // TP/SL hit during the candle → exit handled
 
     const candle = await getLastClosedCandle(bot.symbol, bot.decisionTf);
     if(!candle || candle.time===bot.lastDecisionCandle) return;
     bot.lastDecisionCandle = candle.time;
+
+    // HOLDING A POSITION? On each new candle, let Claude REVIEW it — hold, adjust
+    // the stop/target, or close. SL & TP always remain set (adjust, never remove).
+    if(bot.position){ try{ await reviewOpenPosition(bot); }catch(e){ aiBotLog(bot,`review error: ${e.message}`,'err'); } return; }
 
     const k = await mexcPublic(`/api/v1/contract/kline/${bot.symbol}?interval=${bot.decisionTf}&limit=150`);
     if(!k || !k.success) return;
@@ -1050,7 +1063,9 @@ ${bot.lineSource==='user'?'Only trade setups that interact with the TRADER\'S OW
 
 Respond ONLY JSON:
 {"action":"long"|"short"|"close"|"hold","pattern":"name or none","leverage":1-${bot.maxLeverage},"tpPrice":number,"slPrice":number,"reasoning":"2 sentences max","lines":[{"label":"e.g. flag upper","p1":{"time":unix_seconds,"price":n},"p2":{"time":unix_seconds,"price":n}}]}
-"lines" = the pattern lines you see (max 4), so the trader can view them on their chart.`;
+"lines" = the pattern lines you see (max 4), so the trader can view them on their chart.
+
+MANDATORY: if action is long or short, you MUST provide both slPrice and tpPrice. slPrice goes on the losing side of entry (below for long, above for short); tpPrice on the winning side. A trade with no stop or no target is forbidden — if you can't define a sensible stop and target with at least ~2x reward:risk, choose "hold" instead.`;
 
     const raw = await callClaude(prompt);
     let d;
@@ -1064,10 +1079,52 @@ Respond ONLY JSON:
 
     if(d.action==='close' && bot.position) return aiBotClose(bot,'AI decision');
     if((d.action==='long'||d.action==='short') && !bot.position){
+      const side = d.action==='long'?'BUY':'SELL';
+      const tp = parseFloat(d.tpPrice), sl = parseFloat(d.slPrice);
+      // HARD RULE: never open without a valid SL and TP on the correct side of entry.
+      const slOk = isFinite(sl) && sl>0 && (side==='BUY' ? sl < price : sl > price);
+      const tpOk = isFinite(tp) && tp>0 && (side==='BUY' ? tp > price : tp < price);
+      if(!slOk || !tpOk){
+        aiBotLog(bot, `⛔ ${side} REJECTED — entry must have valid SL & TP. Got SL=${d.slPrice} TP=${d.tpPrice} @ entry $${price}. No trade.`, 'err');
+        return; // refuse the trade entirely; equity/table only ever see protected, closed trades
+      }
       const lev = Math.min(bot.maxLeverage, Math.max(1, parseInt(d.leverage)||3));
-      await aiBotOpen(bot, d.action==='long'?'BUY':'SELL', price, lev, d.tpPrice, d.slPrice, `[${d.pattern}] ${d.reasoning}`);
+      await aiBotOpen(bot, side, price, lev, tp, sl, `[${d.pattern}] ${d.reasoning}`);
     }
   }catch(e){ aiBotLog(bot,`tick error: ${e.message}`,'err'); }
+}
+
+// Review an open position at a candle close: Claude may HOLD, ADJUST sl/tp
+// (e.g. trail the stop, extend the target), or CLOSE. SL and TP stay mandatory.
+async function reviewOpenPosition(bot){
+  const pos = bot.position; if(!pos) return;
+  const price = await getTicker(bot.symbol); if(price==null) return;
+  const dir = pos.side==='BUY'?1:-1;
+  const unrealR = pos.slPrice ? (((price-pos.entryPrice)*dir)/Math.abs(pos.entryPrice-pos.slPrice)).toFixed(2) : '?';
+  const prompt = `You hold an open ${pos.side} on ${bot.symbol} (${bot.decisionTf}). Review it at this candle close.
+Entry $${pos.entryPrice} | current $${price} | SL $${pos.slPrice} | TP $${pos.tpPrice} | unrealized ${unrealR}R.
+${journalForPrompt()||''}
+Decide: keep holding, adjust the stop/target (e.g. trail stop to lock profit, or extend target if momentum is strong), or close now if the thesis is broken.
+A stop-loss and take-profit MUST always remain set — you may move them but never remove them. Only move a stop in the trade's favour (never widen risk).
+Respond ONLY JSON: {"action":"hold"|"adjust"|"close","slPrice":number,"tpPrice":number,"reasoning":"1 sentence"}`;
+  let raw, d;
+  try{ raw = await callClaude(prompt); d = JSON.parse(raw.replace(/```json|```/g,'').trim()); }
+  catch(e){ return; } // on any failure, leave the position exactly as-is (still protected)
+
+  if(d.action==='close'){ aiBotLog(bot,`review→close: ${d.reasoning}`,'info'); return aiBotClose(bot,'AI review close'); }
+  if(d.action==='adjust'){
+    const nsl = parseFloat(d.slPrice), ntp = parseFloat(d.tpPrice);
+    // Validate: both still present & on the correct side; stop may only move favourably.
+    const slSideOk = isFinite(nsl) && (pos.side==='BUY' ? nsl < price : nsl > price);
+    const tpSideOk = isFinite(ntp) && (pos.side==='BUY' ? ntp > price : ntp < price);
+    const stopFavourable = isFinite(nsl) && (pos.side==='BUY' ? nsl >= pos.slPrice : nsl <= pos.slPrice);
+    if(slSideOk && stopFavourable) pos.slPrice = nsl;
+    if(tpSideOk) pos.tpPrice = ntp;
+    aiBotLog(bot,`review→adjust: SL $${pos.slPrice.toFixed(0)} TP $${pos.tpPrice.toFixed(0)} — ${d.reasoning}`,'ok');
+    saveState();
+  } else {
+    aiBotLog(bot,`review→hold: ${d.reasoning||''}`,'info');
+  }
 }
 
 setInterval(patternTick, 13000);
@@ -1477,7 +1534,10 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
       enabled: bot.enabled, paper: bot.paper, hasApiKey: !!ANTHROPIC_KEY,
       allocation: bot.allocation, realizedPnl: bot.realizedPnl,
       position: bot.position, decisions: bot.decisions.slice(-12),
-      tradeHistory: bot.tradeHistory.slice(-10), decisionTf: bot.decisionTf,
+      tradeHistory: bot.tradeHistory.slice(-200), decisionTf: bot.decisionTf,
+      equityCurve: (()=>{ let eq=bot.allocation||100; const out=[{t:null, eq}];
+        for(const tr of bot.tradeHistory){ eq+=tr.pnl; out.push({t:tr.t, eq:+eq.toFixed(2)}); } return out; })(),
+      startAllocation: bot.allocation||100,
       lineSource: bot.lineSource, aiLines: bot.aiLines, swingMode: !!bot.swingMode,
       userLines: (savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines) || [],
     });
