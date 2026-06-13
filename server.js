@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.43';
+const SERVER_BUILD = '2026-06-13.45';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -825,7 +825,7 @@ function newAiBot(name){
     decisionTf:'Min60', symbol:'BTC_USDT',
     maxLeverage:10, maxRiskPct:5, killSwitchPct:50,
     position:null, realizedPnl:0, decisions:[], tradeHistory:[],
-    lastDecisionCandle:null, aiLines:[], lineSource:'both',
+    lastDecisionCandle:null, aiLines:[], lineSource:'both', swingMode:false,
   };
 }
 let aiBots = { pattern: newAiBot('pattern') };
@@ -1015,7 +1015,9 @@ Swing lows: ${pivotLows.slice(-8).map(p=>`[${new Date(times[p.i]*1000).toISOStri
 
 CRITICAL — ROOM TO RUN / RISK-REWARD AT ENTRY: Before any entry, check how much room there is to the next strong level in your trade's direction. Do NOT open a long when price is already close beneath strong resistance, or a short close above strong support — even if the move is WITH the trend. That kind of entry is a low-reward scalp into a wall: the target is cramped and the risk/reward is poor, even when it happens to hit TP. As a breakout trader you want to enter where there is meaningful room to run — ideally just AFTER price breaks through a level (with a retest), not as it approaches one from below/above. If price is approaching a level and hasn't broken it, prefer to WAIT for the break rather than squeeze a small long/short into the remaining distance. Require a take-profit that is at least ~2x your stop distance; if the nearest strong level caps the upside below that, skip the trade.
 
-You MAY occasionally take a deliberate counter-trend trade INTO support/resistance, but only on a genuinely strong reversal setup (clean SFP sweep + reversal candle + level holding) — the rare exception, not the default.
+${bot.swingMode
+  ? `SWING MODE IS ON: In addition to breakouts, you may actively SWING TRADE from key levels — go LONG from at/near strong SUPPORT, or SHORT from at/near strong RESISTANCE — but ONLY after a confirmed reversal at that level (e.g. an SFP sweep of the level AND a reversal candle like engulfing/morning-star/evening-star, with the level holding on the close). The level you enter near must be a strong one (daily/weekly S/R, or the trader's own drawn line), and there must be room to run to the next opposite level (aim for >=2x risk). No confirmation = no counter-level trade; wait. You are still a breakout trader at heart — swing entries are a genuine second mode here, not a licence to fade every level.`
+  : `SWING MODE IS OFF: You are breakout-only. Do NOT take longs into support or shorts into resistance as a primary play. Only trade breakouts (and the rare exceptional reversal noted above). When price sits near a level without breaking it, WAIT.`}
 
 You also recognise these patterns: ascending/descending wedges, bull/bear flags, head & shoulders, inverse H&S, channels, swing failure patterns (SFP), and breaks of daily/weekly support/resistance. Be selective — most candles deserve "hold".
 
@@ -1353,6 +1355,7 @@ http.createServer(async (req, res)=>{
     bot.decisionTf = b.decisionTf || 'Min60';
     bot.symbol = b.symbol || 'BTC_USDT';
     if(b.lineSource) bot.lineSource = b.lineSource;
+    if(b.swingMode != null) bot.swingMode = !!b.swingMode;
     // Mark the most-recent CLOSED candle as already-seen, so the bot waits for
     // the NEXT candle to close before deciding — rather than acting immediately
     // on the candle in progress at the moment you press start.
@@ -1370,6 +1373,13 @@ http.createServer(async (req, res)=>{
     blog(`🧠 PATTERN bot stopped`,'warn');
     saveState();
     return json(res,200,{stopped:true});
+  }
+  if(url==='/ai2/pattern/setmode' && req.method==='POST'){
+    const b = await readBody(req);
+    if(b.swingMode != null){ aiBots.pattern.swingMode = !!b.swingMode;
+      blog(`🧠 Pattern bot swing mode ${aiBots.pattern.swingMode?'ON — will swing from S/R after reversals':'OFF — breakout only'}`,'ok'); saveState(); }
+    if(b.lineSource){ aiBots.pattern.lineSource = b.lineSource; saveState(); }
+    return json(res,200,{swingMode:aiBots.pattern.swingMode, lineSource:aiBots.pattern.lineSource});
   }
   if(url==='/ai2/pattern/close' && req.method==='POST'){
     const bot = aiBots.pattern;
@@ -1468,7 +1478,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
       allocation: bot.allocation, realizedPnl: bot.realizedPnl,
       position: bot.position, decisions: bot.decisions.slice(-12),
       tradeHistory: bot.tradeHistory.slice(-10), decisionTf: bot.decisionTf,
-      lineSource: bot.lineSource, aiLines: bot.aiLines,
+      lineSource: bot.lineSource, aiLines: bot.aiLines, swingMode: !!bot.swingMode,
       userLines: (savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines) || [],
     });
   }
