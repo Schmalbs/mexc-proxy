@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.41';
+const SERVER_BUILD = '2026-06-13.43';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1011,7 +1011,13 @@ Swing lows: ${pivotLows.slice(-8).map(p=>`[${new Date(times[p.i]*1000).toISOStri
       return `${new Date(t*1000).toISOString().slice(5,16)} O${k.data.open[idx]} H${highs[idx]} L${lows[idx]} C${closes[idx]}`;
     }).join('\n');
 
-    const prompt = `You are a chart-pattern swing trader on ${bot.symbol} ${bot.decisionTf}. You trade: ascending/descending wedges, bull/bear flags, head & shoulders, inverse H&S, channels, swing failure patterns (SFP), and breaks of daily/weekly support/resistance. Be selective — most candles deserve "hold".
+    const prompt = `You are primarily a BREAKOUT TRADER on ${bot.symbol} ${bot.decisionTf}. Your core edge is trading breakouts: price breaking out of consolidation, wedges, flags, channels, and decisively breaking through daily/weekly support/resistance. That is your identity — when in doubt, you trade WITH breakout momentum, not against it.
+
+CRITICAL — ROOM TO RUN / RISK-REWARD AT ENTRY: Before any entry, check how much room there is to the next strong level in your trade's direction. Do NOT open a long when price is already close beneath strong resistance, or a short close above strong support — even if the move is WITH the trend. That kind of entry is a low-reward scalp into a wall: the target is cramped and the risk/reward is poor, even when it happens to hit TP. As a breakout trader you want to enter where there is meaningful room to run — ideally just AFTER price breaks through a level (with a retest), not as it approaches one from below/above. If price is approaching a level and hasn't broken it, prefer to WAIT for the break rather than squeeze a small long/short into the remaining distance. Require a take-profit that is at least ~2x your stop distance; if the nearest strong level caps the upside below that, skip the trade.
+
+You MAY occasionally take a deliberate counter-trend trade INTO support/resistance, but only on a genuinely strong reversal setup (clean SFP sweep + reversal candle + level holding) — the rare exception, not the default.
+
+You also recognise these patterns: ascending/descending wedges, bull/bear flags, head & shoulders, inverse H&S, channels, swing failure patterns (SFP), and breaks of daily/weekly support/resistance. Be selective — most candles deserve "hold".
 
 An SFP (swing failure pattern) is when price wicks BEYOND a prior swing high/low but CLOSES back inside it — a failed breakout that sweeps liquidity and often reverses. A bearish SFP (wick above a swing high, close below) favours shorts; a bullish SFP (wick below a swing low, close above) favours longs. SFPs are higher-conviction when the wick is a clean sweep and the close is decisively back inside.
 
