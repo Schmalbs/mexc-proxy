@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.39';
+const SERVER_BUILD = '2026-06-13.40';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1347,7 +1347,14 @@ http.createServer(async (req, res)=>{
     bot.decisionTf = b.decisionTf || 'Min60';
     bot.symbol = b.symbol || 'BTC_USDT';
     if(b.lineSource) bot.lineSource = b.lineSource;
-    bot.lastDecisionCandle = null;
+    // Mark the most-recent CLOSED candle as already-seen, so the bot waits for
+    // the NEXT candle to close before deciding — rather than acting immediately
+    // on the candle in progress at the moment you press start.
+    try{
+      const c = await getLastClosedCandle(bot.symbol, bot.decisionTf);
+      bot.lastDecisionCandle = c ? c.time : null;
+      if(c) blog(`Pattern bot will wait for the next ${bot.decisionTf} close (last closed candle @ ${new Date(c.time*1000).toISOString().slice(11,16)}Z seen)`,'info');
+    }catch(e){ bot.lastDecisionCandle = null; }
     blog(`🧠 PATTERN bot STARTED — $${bot.allocation} ${bot.paper?'PAPER':'LIVE'} [${bot.decisionTf}] lines:${bot.lineSource}`,'ok');
     sendTelegram(`🧠 <b>Pattern bot started</b>\n$${bot.allocation} ${bot.paper?'📝 paper':'💸 LIVE'} | ${bot.decisionTf}`);
     return json(res,200,{started:true});
