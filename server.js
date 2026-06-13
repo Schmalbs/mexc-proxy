@@ -10,7 +10,50 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.36';
+const SERVER_BUILD = '2026-06-13.38';
+const fs = require('fs');
+
+// ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
+// We write all critical state there so it survives restarts/redeploys. Falls
+// back to a local dir when the volume isn't present (e.g. local testing).
+const STATE_DIR  = process.env.RAILWAY_VOLUME_MOUNT_PATH || './data';
+const STATE_FILE = STATE_DIR + '/trader-state.json';
+try { fs.mkdirSync(STATE_DIR, { recursive: true }); } catch(e){}
+
+let _saveTimer = null;
+function saveState(){
+  // debounced: coalesce rapid changes into one write
+  if(_saveTimer) return;
+  _saveTimer = setTimeout(()=>{
+    _saveTimer = null;
+    try{
+      const state = {
+        v: 1, savedAt: Date.now(),
+        bots, botIdCounter,
+        patternBot: aiBots && aiBots.pattern ? {
+          enabled: aiBots.pattern.enabled, paper: aiBots.pattern.paper,
+          allocation: aiBots.pattern.allocation, startEquity: aiBots.pattern.startEquity,
+          decisionTf: aiBots.pattern.decisionTf, symbol: aiBots.pattern.symbol,
+          lineSource: aiBots.pattern.lineSource,
+          position: aiBots.pattern.position, realizedPnl: aiBots.pattern.realizedPnl,
+          tradeHistory: aiBots.pattern.tradeHistory, decisions: aiBots.pattern.decisions,
+          lastDecisionCandle: aiBots.pattern.lastDecisionCandle,
+        } : null,
+        patternJournal,
+        savedChartLines,
+      };
+      fs.writeFileSync(STATE_FILE, JSON.stringify(state));
+    }catch(e){ console.log('[STATE] save failed:', e.message); }
+  }, 1500);
+}
+function loadState(){
+  try{
+    if(!fs.existsSync(STATE_FILE)) return null;
+    const st = JSON.parse(fs.readFileSync(STATE_FILE,'utf8'));
+    console.log(`[STATE] restored from ${STATE_FILE} (saved ${new Date(st.savedAt).toISOString()})`);
+    return st;
+  }catch(e){ console.log('[STATE] load failed:', e.message); return null; }
+}
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -65,6 +108,22 @@ setInterval(refreshContracts, 6*3600*1000);
 
 // ── Saved chart lines (synced across devices; cleared on restart) ──
 let savedChartLines = {}; // { symbol: {lines:[...]} }
+
+// ── Pattern-bot trading journal & standing instructions ──
+// In-memory (cleared on restart) but mirrored to the AI page's localStorage,
+// which re-seeds the server on reconnect. Entries: {id, t, kind, text}.
+//   kind: 'instruction' = standing rule the bot always follows
+//         'note'        = an observation/lesson to weigh
+//         'chat'        = conversation turn (not fed into trade decisions)
+let patternJournal = [];
+function journalForPrompt(){
+  const instr = patternJournal.filter(e=>e.kind==='instruction');
+  const notes = patternJournal.filter(e=>e.kind==='note');
+  let out = '';
+  if(instr.length) out += `STANDING INSTRUCTIONS FROM THE TRADER (always follow these):\n${instr.map(e=>`• ${e.text}`).join('\n')}\n\n`;
+  if(notes.length) out += `TRADER'S JOURNAL — observations & lessons to weigh before entering (most recent last):\n${notes.slice(-20).map(e=>`• ${e.text}`).join('\n')}`;
+  return out.trim();
+}
 
 // ── Public data cache (3s TTL) ──
 const proxyCache = new Map();
@@ -237,6 +296,7 @@ async function runBot(bot){
         blog(`⚠️ Bot #${bot.id}: position closed externally on MEXC — clearing tracking`,'warn');
         bot.activeTrade = null;
         retireBot(bot, 'position closed externally on MEXC');
+        saveState();
         return;
       }
     }
@@ -503,6 +563,7 @@ async function runBot(bot){
       openedAt: Date.now(),
     };
     bot.lastTpCandle = null; bot.lastSlCandle = null;
+    saveState();
   } else {
     bot.failCount = (bot.failCount||0) + 1;
     blog(`Bot #${bot.id} order error (${bot.failCount}/3): ${JSON.stringify(res)}`, 'err');
@@ -519,6 +580,7 @@ async function runBot(bot){
 function retireBot(bot, why){
   bots = bots.filter(b => b.id !== bot.id);
   blog(`🏁 Bot #${bot.id} RETIRED — ${why}. One-shot: it will not re-enter. Re-arm to watch again.`,'warn');
+  saveState();
   sendTelegram(`🏁 <b>Bot #${bot.id} retired</b> — ${why}.\nIt will NOT open another trade. Re-arm from the app if you want it watching again.`);
 }
 
@@ -788,6 +850,7 @@ async function aiBotOpen(bot, side, entry, lev, tpPrice, slPrice, reasoning){
     if(!r.success) return aiBotLog(bot,`Order failed: ${JSON.stringify(r).slice(0,120)}`,'err');
   }
   bot.position = { side, entryPrice:entry, qty, leverage:lev, tpPrice, slPrice, openedAt:Date.now() };
+  saveState();
   const mode = bot.paper?'📝 PAPER':'💸 LIVE';
   aiBotLog(bot, `${mode} ${side} @ $${entry} | ${qty}c ${lev}× | TP $${tpPrice.toFixed(0)} SL $${slPrice.toFixed(0)}`, 'ok');
   sendTelegram(`🤖 <b>[${bot.name.toUpperCase()}] ${mode} ${side}</b> ${bot.symbol}\nEntry $${entry} | ${lev}× | ${qty}c\nTP $${tpPrice.toFixed(0)} | SL $${slPrice.toFixed(0)}\n<i>${(reasoning||'').slice(0,300)}</i>`);
@@ -809,6 +872,7 @@ async function aiBotClose(bot, reason, price){
   aiBotLog(bot, `${emoji} ${reason}: ${pos.side} closed @ $${price} | ${pnl>=0?'+':''}$${pnl.toFixed(2)} | total ${bot.realizedPnl>=0?'+':''}$${bot.realizedPnl.toFixed(2)}`, pnl>=0?'ok':'err');
   sendTelegram(`${emoji} <b>[${bot.name.toUpperCase()}] closed ${pos.side}</b> (${reason})\nExit $${price} | P&L ${pnl>=0?'+':''}$${pnl.toFixed(2)}\nBot total: ${bot.realizedPnl>=0?'+':''}$${bot.realizedPnl.toFixed(2)} ${bot.paper?'(paper)':''}`);
   bot.position = null;
+  saveState();
 }
 
 async function aiBotManageExits(bot){
@@ -949,6 +1013,7 @@ CURRENT PRICE: $${price}
 EQUITY: $${aiEquity(bot).toFixed(2)} ${bot.paper?'(PAPER MODE)':''}
 POSITION: ${bot.position?`${bot.position.side} @ $${bot.position.entryPrice}`:'none'}
 
+${journalForPrompt() ? journalForPrompt()+'\n\nBefore deciding, explicitly check the setup against your standing instructions and journal. If a standing instruction says not to trade here, HOLD. Reference the relevant journal lessons in your reasoning.\n' : ''}
 ${reversals.length ? `🕯️ CANDLESTICK REVERSAL SIGNALS (confluence — weigh more when they align with an SFP sweep or a key level; higher timeframe = stronger):\n${reversals.map(r=>`${r.tf} ${r.pattern} (${r.dir})`).join('\n')}\nThese are supporting evidence for a reversal, NOT standalone triggers. A daily or weekly engulfing/star stacked with a swept level is high conviction; a lone 1h engulfing is weak.` : ''}
 
 ${htfSfps.length ? `🚨🚨 HIGH-TIMEFRAME SWING FAILURE — THE MOST IMPORTANT SIGNAL ON THIS CHART, DO NOT IGNORE:\n${htfSfps.map(s=>`${s.tf} ${s.type.toUpperCase()} SFP — price swept the ${s.tf.toLowerCase()} swing ${s.type==='bearish'?'high':'low'} at $${s.level.toFixed(0)} (reached $${s.wick.toFixed(0)}, ${s.penetrationPct}% beyond) and is back ${s.type==='bearish'?'below':'above'} it at $${s.close.toFixed(0)}.`).join('\n')}\nA daily/weekly SFP is a far higher-conviction reversal signal than any intraday pattern. Give it strong weight. Still apply risk management and confirm the close holds.` : ''}
@@ -1126,6 +1191,7 @@ http.createServer(async (req, res)=>{
     }
     blog(`Bot #${bot.id} full config: ${JSON.stringify(config)}`, 'info');
     sendTelegram(`🤖 <b>Bot #${bot.id} ARMED</b>\n${config.symbol} — candle close ${config.dir} ${srcLabel} [${config.trigTf}]\nTotal bots: ${bots.length}`);
+    saveState();
     return json(res,200,{armed:true, id: bot.id, totalBots: bots.length});
   }
 
@@ -1145,6 +1211,7 @@ http.createServer(async (req, res)=>{
     blog(`✏️ Bot #${bot.id} UPDATED — ${config.dir} ${config.triggerSource==='price'?'price $'+config.manualPrice:'line '+config.selectedLineId} [${config.trigTf}]`,'ok');
     blog(`Bot #${bot.id} new config: ${JSON.stringify(config)}`,'info');
     sendTelegram(`✏️ <b>Bot #${bot.id} updated</b>\n${config.symbol} ${config.dir} [${config.trigTf}]`);
+    saveState();
     return json(res,200,{updated:true, id:bot.id});
   }
 
@@ -1156,6 +1223,7 @@ http.createServer(async (req, res)=>{
       bots = bots.filter(x => x.id !== bot.id);
       blog(`Bot #${bot.id} DISARMED${bot.activeTrade?' (its open trade is no longer managed!)':''} — ${bots.length} bot(s) remaining`,'warn');
       sendTelegram(`🛑 <b>Bot #${bot.id} disarmed</b> — ${bots.length} remaining`);
+      saveState();
       return json(res,200,{armed: bots.length>0, removed: bot.id, totalBots: bots.length});
     }
     // No id = disarm all
@@ -1163,6 +1231,7 @@ http.createServer(async (req, res)=>{
     bots = [];
     blog(`All ${n} bot(s) DISARMED`,'warn');
     sendTelegram('🛑 <b>All bots disarmed</b>');
+    saveState();
     return json(res,200,{armed:false, totalBots: 0});
   }
 
@@ -1244,6 +1313,7 @@ http.createServer(async (req, res)=>{
     bots.push(bot);
     blog(`🤝 Bot #${bot.id} ADOPTED existing ${side} position @ $${entry} (${qty} contracts, ${lev}×) | TP levels: ${JSON.stringify(tpLevels)} | SL: $${slPrice.toFixed(2)}${mexcSlOrderId?' (real SL ✓)':''}`,'ok');
     sendTelegram(`🤝 <b>Bot #${bot.id} adopted position</b>\n${b.symbol} ${side} @ $${entry}\nQty: ${qty} | ${lev}×\nSL: $${slPrice.toFixed(2)}${mexcSlOrderId?' (on exchange ✓)':''}\nTP levels: ${tpLevels.length}`);
+    saveState();
     return json(res,200,{adopted:true, botId: bot.id});
   }
 
@@ -1251,6 +1321,7 @@ http.createServer(async (req, res)=>{
   if(url==='/lines/save' && req.method==='POST'){
     const b = await readBody(req);
     if(b.symbol) savedChartLines[b.symbol] = b.data || {lines:[]};
+    saveState();
     return json(res,200,{saved:true});
   }
   if(url.startsWith('/lines/load')){
@@ -1280,6 +1351,89 @@ http.createServer(async (req, res)=>{
     blog(`🧠 PATTERN bot stopped`,'warn');
     return json(res,200,{stopped:true});
   }
+  // ── JOURNAL CRUD (mirrored to client localStorage) ──
+  if(url==='/ai2/pattern/journal' && req.method==='GET' || url==='/ai2/pattern/journal/list'){
+    return json(res,200,{journal: patternJournal});
+  }
+  if(url==='/ai2/pattern/journal/add' && req.method==='POST'){
+    const b = await readBody(req);
+    const entry = { id: Date.now()+''+Math.floor(Math.random()*1000),
+                    t: Date.now(), kind: b.kind||'note', text: (b.text||'').slice(0,500) };
+    if(!entry.text) return json(res,400,{error:'empty'});
+    patternJournal.push(entry);
+    if(patternJournal.length > 200) patternJournal.shift();
+    blog(`📓 Journal +${entry.kind}: ${entry.text.slice(0,80)}`,'info');
+    saveState();
+    return json(res,200,{added:entry, journal:patternJournal});
+  }
+  if(url==='/ai2/pattern/journal/delete' && req.method==='POST'){
+    const b = await readBody(req);
+    patternJournal = patternJournal.filter(e=>e.id!==b.id);
+    saveState();
+    return json(res,200,{journal:patternJournal});
+  }
+  if(url==='/ai2/pattern/journal/seed' && req.method==='POST'){
+    // client re-seeds server memory after a restart from its localStorage mirror
+    const b = await readBody(req);
+    if(Array.isArray(b.journal) && !patternJournal.length){
+      patternJournal = b.journal.slice(0,200);
+      blog(`📓 Journal re-seeded from client: ${patternJournal.length} entries`,'ok');
+    }
+    return json(res,200,{journal:patternJournal});
+  }
+
+  // ── CHAT with the pattern bot ──
+  if(url==='/ai2/pattern/chat' && req.method==='POST'){
+    if(!ANTHROPIC_KEY) return json(res,400,{error:'needs ANTHROPIC_API_KEY'});
+    const b = await readBody(req);
+    const userMsg = (b.message||'').slice(0,1000);
+    if(!userMsg) return json(res,400,{error:'empty message'});
+    const bot = aiBots.pattern;
+
+    // Context: live market snapshot + recent decisions + the journal
+    let mkt = '';
+    try{
+      const price = await getTicker(bot.symbol);
+      mkt = `Current ${bot.symbol} price: $${price}. Bot is ${bot.enabled?'RUNNING':'stopped'}, ${bot.paper?'paper':'LIVE'}, equity $${aiEquity(bot).toFixed(2)}, position: ${bot.position?bot.position.side+' @ $'+bot.position.entryPrice:'none'}.`;
+    }catch(e){}
+    const recent = bot.decisions.slice(-6).map(d=>`${new Date(d.t).toLocaleString()}: ${d.action}${d.pattern&&d.pattern!=='none'?' ['+d.pattern+']':''} — ${d.reasoning}`).join('\n') || 'No decisions yet.';
+    const history = (b.history||[]).slice(-8).map(m=>`${m.role==='user'?'TRADER':'BOT'}: ${m.text}`).join('\n');
+
+    const prompt = `You are the trader's chart-pattern swing-trading bot for ${bot.symbol}. You are having a conversation with the trader. Be concise, direct, and willing to PUSH BACK — if they suggest something you think is risky or contradicts good risk management, say so plainly. You're a thoughtful trading partner, not a yes-man.
+
+${mkt}
+
+YOUR RECENT DECISIONS:
+${recent}
+
+${journalForPrompt()||'No journal entries yet.'}
+
+CONVERSATION SO FAR:
+${history}
+
+TRADER: ${userMsg}
+
+Reply conversationally (2-5 sentences). If the trader is giving you a standing rule to follow or an observation worth remembering, end your reply with a line exactly like:
+[JOURNAL:instruction] the rule in your words
+or
+[JOURNAL:note] the observation in your words
+Only add that tag if it's genuinely a durable instruction/lesson — not for ordinary chat.`;
+
+    let reply='';
+    try{ reply = await callClaude(prompt); }
+    catch(e){ return json(res,500,{error:'chat failed: '+e.message}); }
+
+    // Auto-capture a journal entry if the bot proposed one
+    let captured = null;
+    const m = reply.match(/\[JOURNAL:(instruction|note)\]\s*(.+)$/m);
+    if(m){
+      captured = { id: Date.now()+''+Math.floor(Math.random()*1000), t: Date.now(), kind: m[1], text: m[2].trim().slice(0,500) };
+      patternJournal.push(captured);
+      reply = reply.replace(/\[JOURNAL:(instruction|note)\]\s*.+$/m,'').trim();
+    }
+    return json(res,200,{reply, captured, journal:patternJournal});
+  }
+
   if(url==='/ai2/pattern/status'){
     const bot = aiBots.pattern;
     return json(res,200,{
@@ -1413,7 +1567,24 @@ http.createServer(async (req, res)=>{
   json(res,404,{error:'not found'});
 
 }).listen(PORT, ()=> {
-  blog(`🔄 SERVER STARTED — build ${SERVER_BUILD} (all bots cleared by restart)`, 'warn');
+  // ── RESTORE persisted state (survives restarts via Railway volume) ──
+  const st = loadState();
+  if(st){
+    try{
+      if(Array.isArray(st.bots)) bots = st.bots;
+      if(st.botIdCounter) botIdCounter = st.botIdCounter;
+      if(st.patternJournal) patternJournal = st.patternJournal;
+      if(st.savedChartLines) savedChartLines = st.savedChartLines;
+      if(st.patternBot && aiBots.pattern) Object.assign(aiBots.pattern, st.patternBot);
+      const openTrades = bots.filter(b=>b.activeTrade).length + (aiBots.pattern&&aiBots.pattern.position?1:0);
+      blog(`🔄 SERVER STARTED — build ${SERVER_BUILD} — RESTORED ${bots.length} bot(s), ${openTrades} open trade(s), ${patternJournal.length} journal entries from volume`, 'ok');
+      sendTelegram(`🔄 <b>Server restarted — state RESTORED</b>\n${bots.length} bot(s), ${openTrades} open trade(s) recovered from disk. No re-arm needed.`);
+    }catch(e){
+      blog(`🔄 SERVER STARTED — build ${SERVER_BUILD} — restore error: ${e.message}`, 'err');
+    }
+  } else {
+    blog(`🔄 SERVER STARTED — build ${SERVER_BUILD} (no saved state — fresh start)`, 'warn');
+  }
   console.log(`MEXC Trend Trader server on :${PORT}`);
   console.log(APP_PASSWORD ? '🔒 Password auth enabled' : '⚠️  Set APP_PASSWORD env var!');
   console.log(MEXC_KEY ? '🔑 MEXC keys loaded' : '⚠️  Set MEXC_API_KEY / MEXC_API_SECRET env vars!');
