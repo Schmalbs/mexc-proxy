@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.29';
+const SERVER_BUILD = '2026-06-13.31';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -168,16 +168,25 @@ async function getTicker(symbol){
 // side: 1=open long, 2=close short, 3=open short, 4=close long
 // executeCycle: 1=always, triggerType: 1=mark price
 async function placeStopOrder(symbol, side, vol, triggerPrice, leverage){
+  // MEXC planorder/place — parameters verified against CCXT's working implementation.
+  // The 3002 error was caused by the MISSING triggerType field (not orderType).
+  //   triggerType: 1 = last price, 2 = fair price, 3 = index price
+  //   trend:       1 = trigger when price RISES to triggerPrice, 2 = when it FALLS
+  //   orderType:   1 = the order placed once triggered (MEXC accepts 1 here with price:0 = market-style fill)
+  // For a STOP-LOSS we want: long position (close side 4) stops when price FALLS → trend 2;
+  //                          short position (close side 2) stops when price RISES → trend 1.
   const payload = {
     symbol,
-    side,
+    side,                       // 4 = close long, 2 = close short
     vol,
     leverage: leverage||1,
-    openType: 1, // isolated
+    openType: 1,                // isolated
     triggerPrice,
-    executeCycle: 3, // valid until cancelled (1 would expire after 24h!)
-    orderType: 5, // MARKET on trigger — orderType 1 (limit) requires a price → error 2007
-    trend: side===4 ? 2 : 1, // 1=price rises to trigger (for shorts), 2=price falls (for longs closing)
+    triggerType: 1,             // ← THE FIX: was absent → caused code 3002
+    executeCycle: 2,            // 1 = 24h, 2 = until cancelled (weekly)
+    orderType: 1,               // CCXT-proven value for plan orders
+    trend: side===4 ? 2 : 1,    // long stop triggers on fall (2); short stop on rise (1)
+    price: triggerPrice,        // limit price for the resulting order; = trigger for near-market fill
   };
   blog(`→ STOP ORDER ${JSON.stringify(payload)}`, 'info');
   const res = await mexcRequest('POST', '/api/v1/private/planorder/place', payload);
@@ -338,9 +347,17 @@ async function runBot(bot){
   const side = dir==='above' ? 'BUY' : 'SELL';
   let triggered = false, triggerLabel = '';
 
+  // PENETRATION BUFFER: the close must clear the level by this fraction, so a
+  // fractional poke through a line (esp. a rising trend line price is riding
+  // along) doesn't count as a real break. Default 0.1%; set cfg.breakBufferPct
+  // to 0 to restore exact-touch behaviour.
+  const bufPct = (cfg.breakBufferPct != null ? cfg.breakBufferPct : 0.1) / 100;
+  const above = (close, level) => close > level * (1 + bufPct);
+  const below = (close, level) => close < level * (1 - bufPct);
+
   if(cfg.triggerSource === 'price'){
     const tp = parseFloat(cfg.manualPrice);
-    triggered = (dir==='above' && candle.close > tp) || (dir==='below' && candle.close < tp);
+    triggered = (dir==='above' && above(candle.close, tp)) || (dir==='below' && below(candle.close, tp));
     triggerLabel = `manual price ${tp}`;
   } else {
     const lines = cfg.selectedLineId==='all'
@@ -361,7 +378,7 @@ async function runBot(bot){
 
     for(const line of validLines){
       const lp = priceOnLine(line, candle.time);
-      if((dir==='above' && candle.close > lp) || (dir==='below' && candle.close < lp)){
+      if((dir==='above' && above(candle.close, lp)) || (dir==='below' && below(candle.close, lp))){
         triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(4)}`;
         break;
       }
