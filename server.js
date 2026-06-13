@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.47';
+const SERVER_BUILD = '2026-06-13.48';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1413,6 +1413,7 @@ http.createServer(async (req, res)=>{
     bot.symbol = b.symbol || 'BTC_USDT';
     if(b.lineSource) bot.lineSource = b.lineSource;
     if(b.swingMode != null) bot.swingMode = !!b.swingMode;
+    if(b.riskPct != null) bot.maxRiskPct = Math.min(20, Math.max(0.5, parseFloat(b.riskPct)||5));
     // Mark the most-recent CLOSED candle as already-seen, so the bot waits for
     // the NEXT candle to close before deciding — rather than acting immediately
     // on the candle in progress at the moment you press start.
@@ -1538,7 +1539,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
       equityCurve: (()=>{ let eq=bot.allocation||100; const out=[{t:null, eq}];
         for(const tr of bot.tradeHistory){ eq+=tr.pnl; out.push({t:tr.t, eq:+eq.toFixed(2)}); } return out; })(),
       startAllocation: bot.allocation||100,
-      lineSource: bot.lineSource, aiLines: bot.aiLines, swingMode: !!bot.swingMode,
+      lineSource: bot.lineSource, aiLines: bot.aiLines, swingMode: !!bot.swingMode, riskPct: bot.maxRiskPct,
       userLines: (savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines) || [],
     });
   }
