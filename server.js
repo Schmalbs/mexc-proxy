@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.50';
+const SERVER_BUILD = '2026-06-14.52';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -231,10 +231,15 @@ async function placeStopOrder(symbol, side, vol, triggerPrice, leverage){
   // MEXC planorder/place — parameters verified against CCXT's working implementation.
   // The 3002 error was caused by the MISSING triggerType field (not orderType).
   //   triggerType: 1 = last price, 2 = fair price, 3 = index price
-  //   trend:       1 = trigger when price RISES to triggerPrice, 2 = when it FALLS
-  //   orderType:   1 = the order placed once triggered (MEXC accepts 1 here with price:0 = market-style fill)
-  // For a STOP-LOSS we want: long position (close side 4) stops when price FALLS → trend 2;
-  //                          short position (close side 2) stops when price RISES → trend 1.
+  //   trend (CORRECTED 2026-06-14 after a live long-stop fired INSTANTLY):
+  //     trend 1 = trigger when price falls to/BELOW triggerPrice
+  //     trend 2 = trigger when price rises to/ABOVE triggerPrice
+  //   Evidence: a long's stop at 63200 with trend:2 filled immediately at 64473
+  //   (price was already above 63200 → "rises to/above" was already true). So a
+  //   PROTECTIVE STOP must use:
+  //     long position  (close side 4): fires when price FALLS  → trend 1
+  //     short position (close side 2): fires when price RISES   → trend 2
+  const isLongStop = (side === 4); // closing a long
   const payload = {
     symbol,
     side,                       // 4 = close long, 2 = close short
@@ -242,12 +247,16 @@ async function placeStopOrder(symbol, side, vol, triggerPrice, leverage){
     leverage: leverage||1,
     openType: 1,                // isolated
     triggerPrice,
-    triggerType: 1,             // ← THE FIX: was absent → caused code 3002
-    executeCycle: 2,            // 1 = 24h, 2 = until cancelled (weekly)
-    orderType: 1,               // CCXT-proven value for plan orders
-    trend: side===4 ? 2 : 1,    // long stop triggers on fall (2); short stop on rise (1)
-    price: triggerPrice,        // limit price for the resulting order; = trigger for near-market fill
+    triggerType: 1,             // last price
+    executeCycle: 2,            // until cancelled
+    orderType: 1,
+    trend: isLongStop ? 1 : 2,  // CORRECTED: long stop fires on FALL (1), short stop on RISE (2)
+    price: triggerPrice,
   };
+  // Safety guard: a protective stop must be on the correct side of the trigger
+  // direction. If something tries to place a long-stop whose trigger sits ABOVE
+  // current handling, MEXC could fire it instantly — we at least log loudly.
+  blog(`→ STOP ORDER (${isLongStop?'LONG stop, fires on FALL':'SHORT stop, fires on RISE'}) trigger $${triggerPrice}`, 'info');
   blog(`→ STOP ORDER ${JSON.stringify(payload)}`, 'info');
   const res = await mexcRequest('POST', '/api/v1/private/planorder/place', payload);
   blog(`← STOP ORDER RESPONSE ${JSON.stringify(res).slice(0,200)}`, res.success?'info':'err');
@@ -294,9 +303,42 @@ async function runBot(bot){
         ((bot.activeTrade.side==='BUY'  && p.positionType===1) ||
          (bot.activeTrade.side==='SELL' && p.positionType===2)));
       if(!stillOpen){
-        blog(`⚠️ Bot #${bot.id}: position closed externally on MEXC — clearing tracking`,'warn');
+        // Work out WHY it closed: our own stop-loss, or something external.
+        const t = bot.activeTrade;
+        let reason = 'closed externally (manual/liquidation/TP)';
+        let exitPrice = null, pnl = null;
+        try{
+          // Pull recent closed orders for this symbol and inspect them
+          const hist = await mexcRequest('GET', `/api/v1/private/order/list/history_orders?symbol=${cfg.symbol}&page_num=1&page_size=20`);
+          if(hist.success && Array.isArray(hist.data)){
+            // Did our stop-loss order fill?
+            const slFill = t.mexcSlOrderId
+              ? hist.data.find(o => String(o.orderId)===String(t.mexcSlOrderId) && (o.state===3 || o.dealVol>0))
+              : null;
+            // Most recent close-side fill (side 4 closes long, side 2 closes short)
+            const closeSide = t.side==='BUY' ? 4 : 2;
+            const lastClose = hist.data.find(o => o.side===closeSide && o.dealVol>0);
+            if(slFill){
+              reason = 'STOP-LOSS filled on MEXC';
+              exitPrice = parseFloat(slFill.dealAvgPrice || slFill.price || t.slPrice);
+            } else if(lastClose){
+              exitPrice = parseFloat(lastClose.dealAvgPrice || lastClose.price);
+              // classify by where it filled relative to entry
+              const dir = t.side==='BUY' ? 1 : -1;
+              reason = ((exitPrice - t.entryPrice)*dir >= 0) ? 'closed in profit (TP or manual)' : 'closed in loss (manual/liquidation)';
+            }
+          }
+        }catch(e){}
+        if(exitPrice!=null){
+          const dir = t.side==='BUY' ? 1 : -1;
+          pnl = (exitPrice - t.entryPrice) * t.qty * contractSize(cfg.symbol) * dir;
+        }
+        const pnlStr = pnl!=null ? ` | ${pnl>=0?'+':''}$${pnl.toFixed(2)}` : '';
+        const exitStr = exitPrice!=null ? ` @ $${exitPrice}` : '';
+        blog(`${pnl!=null&&pnl<0?'🔻':'💰'} Bot #${bot.id} ${t.side} closed — ${reason}${exitStr}${pnlStr}`, pnl!=null&&pnl<0?'err':'ok');
+        sendTelegram(`${pnl!=null&&pnl<0?'🔻':'💰'} <b>Bot #${bot.id} ${t.side} closed</b>\n${reason}${exitStr}${pnlStr}`);
         bot.activeTrade = null;
-        retireBot(bot, 'position closed externally on MEXC');
+        retireBot(bot, reason);
         saveState();
         return;
       }
