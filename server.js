@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.40';
+const SERVER_BUILD = '2026-06-13.41';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1463,6 +1463,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
       position: bot.position, decisions: bot.decisions.slice(-12),
       tradeHistory: bot.tradeHistory.slice(-10), decisionTf: bot.decisionTf,
       lineSource: bot.lineSource, aiLines: bot.aiLines,
+      userLines: (savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines) || [],
     });
   }
 
