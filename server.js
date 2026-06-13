@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-12.28';
+const SERVER_BUILD = '2026-06-13.29';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -556,7 +556,7 @@ function aiLog(msg, type=''){
 function callClaude(prompt){
   return new Promise((resolve, reject)=>{
     const body = JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
+      model: 'claude-sonnet-4-6', // upgraded from Sonnet 4 (2026-06-13)
       max_tokens: 1024,
       messages: [{ role:'user', content: prompt }],
     });
