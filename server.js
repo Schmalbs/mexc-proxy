@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-13.31';
+const SERVER_BUILD = '2026-06-13.36';
 const crypto = require('crypto');
 const { URL } = require('url');
 
@@ -550,25 +550,7 @@ setInterval(botTick, 8000); // bot heartbeat every 8s
 // ─────────────────────────────────────────────────────────────
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
 
-let aiTrader = {
-  enabled: false,
-  symbol: 'BTC_USDT',
-  decisionTf: 'Min60',        // decision cadence = 1h candle closes
-  allocatedUsd: 100,          // the AI's trading allocation
-  startBalance: 100,          // for drawdown kill-switch
-  maxLeverage: 10,
-  maxRiskPct: 5,              // max % of allocation risked per trade
-  killSwitchPct: 50,          // stop everything at -50%
-  position: null,             // { side, entryPrice, qty, leverage, tpPrice, slPrice }
-  realizedPnl: 0,
-  decisions: [],              // log of decisions with reasoning
-  lastDecisionCandle: null,
-  tradeHistory: [],           // closed trades for context
-};
 
-function aiLog(msg, type=''){
-  blog(`[AI] ${msg}`, type);
-}
 
 function callClaude(prompt){
   return new Promise((resolve, reject)=>{
@@ -602,177 +584,7 @@ function callClaude(prompt){
   });
 }
 
-async function aiTraderTick(){
-  if(!aiTrader.enabled || !ANTHROPIC_KEY) return;
-  try{
-    // Kill switch check
-    const equity = aiTrader.allocatedUsd + aiTrader.realizedPnl + aiUnrealized();
-    if(equity <= aiTrader.startBalance * (1 - aiTrader.killSwitchPct/100)){
-      aiLog(`💀 KILL SWITCH — equity $${equity.toFixed(2)} hit -${aiTrader.killSwitchPct}% drawdown. AI trading stopped.`,'err');
-      sendTelegram(`💀 <b>AI Trader kill switch</b>\nEquity: $${equity.toFixed(2)} — trading stopped.`);
-      if(aiTrader.position) await aiClosePosition('KILL SWITCH');
-      aiTrader.enabled = false;
-      return;
-    }
 
-    // Manage open position exits first (price-based TP/SL every tick)
-    if(aiTrader.position){
-      const p = await getTicker(aiTrader.symbol);
-      if(p != null){
-        const pos = aiTrader.position;
-        const tpHit = pos.side==='BUY' ? p >= pos.tpPrice : p <= pos.tpPrice;
-        const slHit = pos.side==='BUY' ? p <= pos.slPrice : p >= pos.slPrice;
-        if(tpHit) return aiClosePosition('TP', p);
-        if(slHit) return aiClosePosition('SL', p);
-      }
-    }
-
-    // Decision only on new candle close of decision TF
-    const candle = await getLastClosedCandle(aiTrader.symbol, aiTrader.decisionTf);
-    if(!candle || candle.time === aiTrader.lastDecisionCandle) return;
-    aiTrader.lastDecisionCandle = candle.time;
-
-    // Gather context: last 100 candles
-    const k = await mexcPublic(`/api/v1/contract/kline/${aiTrader.symbol}?interval=${aiTrader.decisionTf}&limit=100`);
-    if(!k || !k.success) return;
-    const candleData = k.data.time.map((t,i)=>
-      `${new Date(parseInt(t)*1000).toISOString().slice(0,16)} O:${k.data.open[i]} H:${k.data.high[i]} L:${k.data.low[i]} C:${k.data.close[i]} V:${k.data.vol[i]}`
-    ).join('\n');
-
-    const posStr = aiTrader.position
-      ? `OPEN POSITION: ${aiTrader.position.side} ${aiTrader.position.qty} contracts @ $${aiTrader.position.entryPrice} | ${aiTrader.position.leverage}x | TP $${aiTrader.position.tpPrice} | SL $${aiTrader.position.slPrice}`
-      : 'NO OPEN POSITION';
-
-    const histStr = aiTrader.tradeHistory.slice(-10).map(t=>
-      `${t.side} entry:$${t.entry} exit:$${t.exit} pnl:${t.pnl>=0?'+':''}$${t.pnl.toFixed(2)} (${t.reason})`
-    ).join('\n') || 'No closed trades yet';
-
-    const prompt = `You are an autonomous crypto futures trader managing a small real-money account. Your decisions are executed immediately on MEXC ${aiTrader.symbol} perpetual futures.
-
-ACCOUNT STATE:
-- Allocation: $${aiTrader.allocatedUsd}
-- Realized P&L: ${aiTrader.realizedPnl>=0?'+':''}$${aiTrader.realizedPnl.toFixed(2)}
-- Current equity: $${equity.toFixed(2)}
-- ${posStr}
-
-RECENT CLOSED TRADES:
-${histStr}
-
-LAST 100 CANDLES (${aiTrader.decisionTf}):
-${candleData}
-
-RULES:
-- Max leverage: ${aiTrader.maxLeverage}x
-- Max risk per trade: ${aiTrader.maxRiskPct}% of equity (SL distance x size must not exceed this)
-- You may: open a long, open a short, close the current position, adjust TP/SL, or do nothing
-- Be selective — overtrading loses to fees. No trade is a valid choice.
-- Think about trend, momentum, support/resistance, and risk/reward before deciding.
-
-Respond ONLY with JSON, no other text:
-{"action":"long"|"short"|"close"|"adjust"|"hold","leverage":1-${aiTrader.maxLeverage},"riskPct":0.5-${aiTrader.maxRiskPct},"tpPrice":number,"slPrice":number,"reasoning":"one concise paragraph"}`;
-
-    aiLog(`Requesting decision from Claude (candle close ${candle.close})...`,'info');
-    const raw = await callClaude(prompt);
-    let decision;
-    try{
-      decision = JSON.parse(raw.replace(/```json|```/g,'').trim());
-    }catch(e){
-      aiLog(`Could not parse decision: ${raw.slice(0,150)}`,'err');
-      return;
-    }
-
-    aiTrader.decisions.push({ t: Date.now(), candle: candle.close, ...decision });
-    if(aiTrader.decisions.length > 50) aiTrader.decisions.shift();
-    aiLog(`Decision: ${decision.action.toUpperCase()} — ${decision.reasoning}`, 'info');
-
-    // Execute decision
-    if(decision.action === 'hold') return;
-
-    if(decision.action === 'close' && aiTrader.position){
-      const p = await getTicker(aiTrader.symbol);
-      return aiClosePosition('AI decision', p);
-    }
-
-    if((decision.action === 'long' || decision.action === 'short')){
-      if(aiTrader.position){
-        // Close existing first if direction differs
-        const wantSide = decision.action==='long' ? 'BUY':'SELL';
-        if(aiTrader.position.side !== wantSide){
-          const p = await getTicker(aiTrader.symbol);
-          await aiClosePosition('Flip', p);
-        } else {
-          // Same direction — treat as adjust
-          aiTrader.position.tpPrice = decision.tpPrice;
-          aiTrader.position.slPrice = decision.slPrice;
-          aiLog(`Adjusted TP→$${decision.tpPrice} SL→$${decision.slPrice}`,'info');
-          return;
-        }
-      }
-      // Size the position: risk = equity * riskPct; qty from SL distance
-      const entry = candle.close;
-      const lev = Math.min(aiTrader.maxLeverage, Math.max(1, parseInt(decision.leverage)||1));
-      const riskUsd = equity * Math.min(aiTrader.maxRiskPct, decision.riskPct||2)/100;
-      const slDist = Math.abs(entry - decision.slPrice);
-      if(slDist <= 0){ aiLog('Invalid SL distance — skipping','warn'); return; }
-      const cSize = contractSize(SYMBOL);
-      let qty = Math.floor(riskUsd / (slDist * cSize));
-      qty = Math.max(1, qty);
-      // Cap position notional at equity * leverage
-      const maxQty = Math.floor((equity * lev) / (entry * cSize));
-      qty = Math.min(qty, Math.max(1, maxQty));
-
-      const futSide = decision.action==='long' ? 1 : 3;
-      if(lev > 1){
-        await mexcRequest('POST','/api/v1/private/position/change_leverage',{
-          symbol: aiTrader.symbol, leverage: lev, openType: 1
-        }).catch(()=>{});
-      }
-      const r = await placeOrder(aiTrader.symbol, futSide, qty, lev, 1, 0, 5);
-      if(r.success){
-        aiTrader.position = {
-          side: decision.action==='long'?'BUY':'SELL',
-          entryPrice: entry, qty, leverage: lev,
-          tpPrice: decision.tpPrice, slPrice: decision.slPrice,
-          openedAt: Date.now(),
-        };
-        aiLog(`✅ ${decision.action.toUpperCase()} opened: ${qty} contracts @ $${entry} | ${lev}x | TP $${decision.tpPrice} SL $${decision.slPrice}`,'ok');
-        sendTelegram(`🤖🧠 <b>AI ${decision.action.toUpperCase()}</b> ${aiTrader.symbol}\nEntry $${entry} | ${lev}x | ${qty} contracts\nTP $${decision.tpPrice} | SL $${decision.slPrice}\n\n<i>${decision.reasoning}</i>`);
-      } else {
-        aiLog(`Order failed: ${JSON.stringify(r).slice(0,150)}`,'err');
-      }
-    }
-  }catch(e){
-    aiLog(`AI tick error: ${e.message}`,'err');
-  }
-}
-
-function aiUnrealized(){
-  // best-effort: computed at decision time only (live price not always available sync)
-  return 0;
-}
-
-async function aiClosePosition(reason, price){
-  const pos = aiTrader.position;
-  if(!pos) return;
-  if(price == null) price = await getTicker(aiTrader.symbol) || pos.entryPrice;
-  const closeSide = pos.side==='BUY' ? 4 : 2;
-  const r = await placeOrder(aiTrader.symbol, closeSide, pos.qty, pos.leverage, 1, 0, 5);
-  if(r.success){
-    const dir = pos.side==='BUY'?1:-1;
-    const pnl = (price - pos.entryPrice) * pos.qty * contractSize(SYMBOL) * dir;
-    aiTrader.realizedPnl += pnl;
-    aiTrader.tradeHistory.push({ side: pos.side, entry: pos.entryPrice, exit: price, pnl, reason, t: Date.now() });
-    if(aiTrader.tradeHistory.length > 50) aiTrader.tradeHistory.shift();
-    const emoji = pnl>=0 ? '💰' : '🔻';
-    aiLog(`${emoji} ${reason}: closed ${pos.side} @ $${price} | P&L ${pnl>=0?'+':''}$${pnl.toFixed(2)} | Total: ${aiTrader.realizedPnl>=0?'+':''}$${aiTrader.realizedPnl.toFixed(2)}`, pnl>=0?'ok':'err');
-    sendTelegram(`${emoji} <b>AI closed ${pos.side}</b> (${reason})\nExit $${price}\nTrade P&L: ${pnl>=0?'+':''}$${pnl.toFixed(2)}\nAI total: ${aiTrader.realizedPnl>=0?'+':''}$${aiTrader.realizedPnl.toFixed(2)}`);
-    aiTrader.position = null;
-  } else {
-    aiLog(`Close failed: ${JSON.stringify(r).slice(0,150)}`,'err');
-  }
-}
-
-setInterval(aiTraderTick, 10000); // AI heartbeat every 10s
 
 // ═════════════════════════════════════════════════════════════
 // AI BOTS v2 — Pattern Trader + Davidd Systematic
@@ -836,18 +648,125 @@ function findPivots(highs, lows, span=3){
   return {pivotHighs:ph, pivotLows:pl};
 }
 
-// ── Shared AI-bot state ──
+// Scan a higher timeframe (daily/weekly) for a swing failure against its OWN
+// swing points. Uses the live forming candle's high/low (current price as close
+// proxy) so a developing sweep is caught intraday, not only after the HTF close.
+// Detect classic candlestick REVERSAL patterns on the last CLOSED candle of a
+// timeframe: bullish/bearish engulfing, morning star, evening star. Returns the
+// patterns found with a direction. Used as confluence, never as a sole trigger.
+async function detectReversalCandles(symbol, interval, label){
+  const k = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${interval}&limit=6`);
+  if(!k || !k.success || !k.data.time || k.data.time.length < 4) return [];
+  const o=k.data.open.map(Number), h=k.data.high.map(Number),
+        l=k.data.low.map(Number), c=k.data.close.map(Number);
+  const n = o.length;
+  const i = n - 2;            // last CLOSED candle (n-1 is still forming)
+  const p = i - 1, pp = i - 2;
+  if(p < 1) return [];
+  const out = [];
+  const body = x => Math.abs(c[x]-o[x]);
+  const isBull = x => c[x] > o[x];
+  const isBear = x => c[x] < o[x];
+  const avgBody = (body(i)+body(p)+body(pp))/3 || 1;
+
+  // ENGULFING (current body fully engulfs prior body, opposite colour)
+  if(isBull(i) && isBear(p) && c[i] >= o[p] && o[i] <= c[p] && body(i) > body(p))
+    out.push({tf:label, pattern:'bullish engulfing', dir:'bullish'});
+  if(isBear(i) && isBull(p) && o[i] >= c[p] && c[i] <= o[p] && body(i) > body(p))
+    out.push({tf:label, pattern:'bearish engulfing', dir:'bearish'});
+
+  // MORNING STAR (down candle → small-body star → strong up candle closing into 1st body)
+  if(isBear(pp) && body(p) < avgBody*0.6 && isBull(i) &&
+     c[i] > (o[pp]+c[pp])/2 && body(pp) > avgBody*0.6)
+    out.push({tf:label, pattern:'morning star', dir:'bullish'});
+  // EVENING STAR (mirror — bearish reversal at tops)
+  if(isBull(pp) && body(p) < avgBody*0.6 && isBear(i) &&
+     c[i] < (o[pp]+c[pp])/2 && body(pp) > avgBody*0.6)
+    out.push({tf:label, pattern:'evening star', dir:'bearish'});
+
+  return out;
+}
+
+async function detectHtfSFP(symbol, interval, label, livePrice){
+  const k = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${interval}&limit=60`);
+  if(!k || !k.success || !k.data.time || k.data.time.length < 8) return [];
+  const highs=k.data.high.map(Number), lows=k.data.low.map(Number),
+        closes=k.data.close.map(Number), times=k.data.time.map(Number);
+  const last = highs.length - 1;                 // the live, forming HTF candle
+  const {pivotHighs, pivotLows} = findPivots(highs, lows, 2);
+  const out = []; const TOL = 0.0005;
+  const close = livePrice || closes[last];
+  for(const sw of pivotHighs){
+    if(sw.i >= last) continue;
+    if(highs[last] > sw.price*(1+TOL) && close < sw.price){
+      out.push({ tf:label, type:'bearish', level:sw.price, wick:highs[last], close,
+                 penetrationPct:+((highs[last]-sw.price)/sw.price*100).toFixed(2) });
+    }
+  }
+  for(const sw of pivotLows){
+    if(sw.i >= last) continue;
+    if(lows[last] < sw.price*(1-TOL) && close > sw.price){
+      out.push({ tf:label, type:'bullish', level:sw.price, wick:lows[last], close,
+                 penetrationPct:+((sw.price-lows[last])/sw.price*100).toFixed(2) });
+    }
+  }
+  return out.sort((a,b)=>b.penetrationPct-a.penetrationPct).slice(0,3);
+}
+
+// Swing Failure Pattern detector. An SFP is a candle that WICKS beyond a prior
+// swing point but CLOSES back inside — a failed breakout / liquidity sweep.
+//   bearish SFP: high pierces a prior swing HIGH, close falls back below it → short bias
+//   bullish SFP: low pierces a prior swing LOW, close climbs back above it → long bias
+// We only look at the most-recently-closed candle (index last) against swings
+// that formed BEFORE it, within a lookback window.
+function detectSFP(highs, lows, closes, opens, times, pivotHighs, pivotLows){
+  const last = closes.length - 1;
+  if(last < 5) return [];
+  const out = [];
+  const TOL = 0.0005; // ignore microscopic pierces (<0.05%)
+  const recentWindow = 60; // only consider swing points within ~60 bars
+
+  // Bearish: did this candle's HIGH pierce a prior swing high but CLOSE below it?
+  for(const sw of pivotHighs){
+    if(sw.i >= last) continue;                  // swing must precede this candle
+    if(last - sw.i > recentWindow) continue;    // not too old
+    const pierced = highs[last] > sw.price * (1 + TOL);
+    const closedBack = closes[last] < sw.price;
+    const wasBelow = closes[last-1] <= sw.price; // approached from below
+    if(pierced && closedBack && wasBelow){
+      out.push({ type:'bearish', level: sw.price, swingTime: times[sw.i],
+                 wick: highs[last], close: closes[last],
+                 penetrationPct: +((highs[last]-sw.price)/sw.price*100).toFixed(2) });
+    }
+  }
+  // Bullish: did this candle's LOW pierce a prior swing low but CLOSE above it?
+  for(const sw of pivotLows){
+    if(sw.i >= last) continue;
+    if(last - sw.i > recentWindow) continue;
+    const pierced = lows[last] < sw.price * (1 - TOL);
+    const closedBack = closes[last] > sw.price;
+    const wasAbove = closes[last-1] >= sw.price;
+    if(pierced && closedBack && wasAbove){
+      out.push({ type:'bullish', level: sw.price, swingTime: times[sw.i],
+                 wick: lows[last], close: closes[last],
+                 penetrationPct: +((sw.price-lows[last])/sw.price*100).toFixed(2) });
+    }
+  }
+  // strongest (deepest sweep that still closed back) first
+  return out.sort((a,b)=>b.penetrationPct-a.penetrationPct).slice(0,4);
+}
+
+// ── Pattern-bot state ──
 function newAiBot(name){
   return {
     name, enabled:false, paper:true, allocation:100, startEquity:100,
     decisionTf:'Min60', symbol:'BTC_USDT',
     maxLeverage:10, maxRiskPct:5, killSwitchPct:50,
     position:null, realizedPnl:0, decisions:[], tradeHistory:[],
-    lastDecisionCandle:null, aiLines:[], lineSource:'both', aiSupervisor:true,
-    params:{ emaFast:21, emaSlow:55, adxMin:23, rsiLow:25, rsiHigh:75, atrSL:2, atrTP:3.5 },
+    lastDecisionCandle:null, aiLines:[], lineSource:'both',
   };
 }
-let aiBots = { pattern: newAiBot('pattern'), davidd: newAiBot('davidd') };
+let aiBots = { pattern: newAiBot('pattern') };
 
 function aiBotLog(bot, msg, type=''){ blog(`[AI:${bot.name}] ${msg}`, type); }
 
@@ -925,77 +844,6 @@ function aiBotKillCheck(bot){
 }
 
 // ── DAVIDD BOT: EMA cross + ADX regime + RSI confirm + ATR risk ──
-async function davidTick(){
-  const bot = aiBots.davidd;
-  if(!bot.enabled) return;
-  try{
-    if(aiBotKillCheck(bot)) return;
-    if(await aiBotManageExits(bot)) return;
-
-    const candle = await getLastClosedCandle(bot.symbol, bot.decisionTf);
-    if(!candle || candle.time===bot.lastDecisionCandle) return;
-    bot.lastDecisionCandle = candle.time;
-
-    const k = await mexcPublic(`/api/v1/contract/kline/${bot.symbol}?interval=${bot.decisionTf}&limit=200`);
-    if(!k || !k.success) return;
-    const closes=k.data.close.map(Number), highs=k.data.high.map(Number), lows=k.data.low.map(Number);
-    const i = closes.length-1;
-    const price = closes[i];
-
-    // ── REGIME DETECTION (live): same 200-EMA slope rule as the backtester ──
-    const phaseSeries = marketPhaseSeries(closes);
-    const regime = phaseSeries[i] || 'chop';
-
-    // Pick strategy + params for THIS regime. If a regimeMap is set, use it;
-    // otherwise fall back to the single configured strategy (legacy behaviour).
-    let stratName, P;
-    if(bot.regimeMap && bot.regimeMap[regime]){
-      stratName = bot.regimeMap[regime].strategy;
-      P = bot.regimeMap[regime].params;
-    } else if(bot.regimeMap){
-      // adaptive mode but this regime deliberately unassigned → stay flat
-      bot.decisions.push({t:Date.now(), candle:price, action:'hold',
-        reasoning:`[adaptive] ${regime.toUpperCase()} regime — no strategy assigned, staying flat`});
-      if(bot.decisions.length>50) bot.decisions.shift();
-      return;
-    } else {
-      stratName = bot.strategy || 'trend';
-      P = bot.params;
-    }
-
-    const ctx = buildCtx({close:closes, high:highs, low:lows}, P);
-    const atr = ctx.atr;
-    const sig = STRATEGIES[stratName].signal(ctx, P, i);
-    const longOk = sig==='long', shortOk = sig==='short';
-
-    const regimeTag = bot.regimeMap ? `${regime.toUpperCase()}→${stratName}` : stratName;
-    bot.decisions.push({t:Date.now(), candle:price,
-      action: longOk?'long':shortOk?'short':'hold',
-      reasoning:`[${regimeTag}] ADX ${ctx.adx[i].toFixed(1)} | RSI ${ctx.rsi[i].toFixed(1)} | EMA ${ctx.emaF[i].toFixed(0)}/${ctx.emaS[i].toFixed(0)} | ATR ${atr[i].toFixed(0)}`});
-    if(bot.decisions.length>50) bot.decisions.shift();
-
-    if(!longOk && !shortOk) return;
-    if(bot.position) return; // one position at a time
-
-    const side = longOk?'BUY':'SELL';
-    const slPrice = side==='BUY' ? price-P.atrSL*atr[i] : price+P.atrSL*atr[i];
-    const tpPrice = side==='BUY' ? price+P.atrTP*atr[i] : price-P.atrTP*atr[i];
-
-    // Optional Claude supervisor veto
-    let reasoning = bot.decisions[bot.decisions.length-1].reasoning;
-    if(bot.aiSupervisor && ANTHROPIC_KEY){
-      try{
-        const verdict = await callClaude(`You supervise a mechanical trend strategy on ${bot.symbol} 1h. Signal: ${side} at $${price}. Context: ${reasoning}. Last 30 closes: ${closes.slice(-30).map(c=>c.toFixed(0)).join(',')}. Reply ONLY JSON: {"approve":true|false,"reason":"one sentence"}`);
-        const v = JSON.parse(verdict.replace(/```json|```/g,'').trim());
-        if(!v.approve){ aiBotLog(bot,`🧠 Supervisor VETO: ${v.reason}`,'warn'); return; }
-        reasoning += ` | Supervisor: ${v.reason}`;
-      }catch(e){}
-    }
-    await aiBotOpen(bot, side, price, 5, tpPrice, slPrice, reasoning);
-  }catch(e){ aiBotLog(bot,`tick error: ${e.message}`,'err'); }
-}
-
-// ── PATTERN BOT: pivots + lines → Claude judges patterns ──
 async function patternTick(){
   const bot = aiBots.pattern;
   if(!bot.enabled || !ANTHROPIC_KEY) return;
@@ -1009,9 +857,45 @@ async function patternTick(){
 
     const k = await mexcPublic(`/api/v1/contract/kline/${bot.symbol}?interval=${bot.decisionTf}&limit=150`);
     if(!k || !k.success) return;
-    const closes=k.data.close.map(Number), highs=k.data.high.map(Number), lows=k.data.low.map(Number), times=k.data.time.map(Number);
+    const closes=k.data.close.map(Number), highs=k.data.high.map(Number), lows=k.data.low.map(Number), times=k.data.time.map(Number), opens=k.data.open.map(Number);
     const {pivotHighs, pivotLows} = findPivots(highs, lows, 3);
+    const sfps = detectSFP(highs, lows, closes, opens, times, pivotHighs, pivotLows);
     const price = closes[closes.length-1];
+    // HIGHER-TIMEFRAME sweeps (daily + weekly) — highest conviction, never miss these
+    const dailySfp  = await detectHtfSFP(bot.symbol, 'Day1',  'DAILY',  price);
+    const weeklySfp = await detectHtfSFP(bot.symbol, 'Week1', 'WEEKLY', price);
+    const htfSfps = [...weeklySfp, ...dailySfp]; // weekly first = most significant
+    // Candlestick reversal confluence across timeframes (1h/4h/daily/weekly)
+    const revTFs = [['Min60','1h'],['Hour4','4h'],['Day1','DAILY'],['Week1','WEEKLY']];
+    let reversals = [];
+    for(const [iv,lbl] of revTFs){
+      const r = await detectReversalCandles(bot.symbol, iv, lbl);
+      reversals = reversals.concat(r);
+    }
+    // Telegram alert for NEW higher-timeframe sweeps (once each), even before
+    // Claude decides — you never want to miss a daily/weekly SFP forming.
+    bot.seenHtfSfp = bot.seenHtfSfp || {};
+    for(const s of htfSfps){
+      const key = `${s.tf}:${s.type}:${Math.round(s.level)}`;
+      if(!bot.seenHtfSfp[key]){
+        bot.seenHtfSfp[key] = Date.now();
+        aiBotLog(bot, `🚨 ${s.tf} ${s.type} SFP — swept $${s.level.toFixed(0)}, back to $${s.close.toFixed(0)} (${s.penetrationPct}%)`, 'ok');
+        sendTelegram(`🚨 <b>${s.tf} SWING FAILURE (${s.type})</b> on ${bot.symbol}\nSwept the ${s.tf.toLowerCase()} swing ${s.type==='bearish'?'high':'low'} at $${s.level.toFixed(0)} → back to $${s.close.toFixed(0)} (${s.penetrationPct}% sweep).\nHigh-conviction reversal zone — pattern bot is evaluating.`);
+      }
+    }
+    // forget sweeps older than 7 days so the same level can re-alert later
+    for(const k in bot.seenHtfSfp){ if(Date.now()-bot.seenHtfSfp[k] > 7*864e5) delete bot.seenHtfSfp[k]; }
+    // Alert on new DAILY/WEEKLY reversal candles (intraday ones are too frequent to ping)
+    bot.seenRev = bot.seenRev || {};
+    for(const r of reversals){
+      if(r.tf!=='DAILY' && r.tf!=='WEEKLY') continue;
+      const key = `${r.tf}:${r.pattern}:${bot.lastDecisionCandle}`;
+      if(!bot.seenRev[key]){
+        bot.seenRev[key] = Date.now();
+        sendTelegram(`🕯️ <b>${r.tf} ${r.pattern}</b> on ${bot.symbol} (${r.dir} reversal). Confluence signal — pattern bot is weighing it.`);
+      }
+    }
+    for(const k in bot.seenRev){ if(Date.now()-bot.seenRev[k] > 14*864e5) delete bot.seenRev[k]; }
 
     // Daily + weekly S/R
     const kd = await mexcPublic(`/api/v1/contract/kline/${bot.symbol}?interval=Day1&limit=8`);
@@ -1030,19 +914,51 @@ async function patternTick(){
     const pivotStr = `Swing highs: ${pivotHighs.slice(-8).map(p=>`[${new Date(times[p.i]*1000).toISOString().slice(5,16)} $${p.price.toFixed(0)}]`).join(' ')}
 Swing lows: ${pivotLows.slice(-8).map(p=>`[${new Date(times[p.i]*1000).toISOString().slice(5,16)} $${p.price.toFixed(0)}]`).join(' ')}`;
 
+    // ── PROXIMITY TO STRONG S/R ──  Is price sitting AT a significant level
+    // right now? Reversal signals are far stronger when they happen here.
+    const NEAR = 0.004; // within 0.4% counts as "at" the level
+    const keyLevels = [];
+    if(wHigh) keyLevels.push({name:'weekly high', price:wHigh, weight:'major'});
+    if(wLow)  keyLevels.push({name:'weekly low',  price:wLow,  weight:'major'});
+    if(dHigh) keyLevels.push({name:'prev daily high', price:dHigh, weight:'strong'});
+    if(dLow)  keyLevels.push({name:'prev daily low',  price:dLow,  weight:'strong'});
+    // recent swing points (clustered swings = stronger horizontal S/R)
+    for(const p of pivotHighs.slice(-6)) keyLevels.push({name:'swing high', price:p.price, weight:'moderate'});
+    for(const p of pivotLows.slice(-6))  keyLevels.push({name:'swing low',  price:p.price, weight:'moderate'});
+    // user's own drawn horizontal lines = highest priority if present
+    if(bot.lineSource!=='ai' && savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines){
+      for(const ln of savedChartLines[bot.symbol].lines)
+        if(ln.isHoriz) keyLevels.push({name:'YOUR drawn level', price:ln.horizPrice, weight:'your level'});
+    }
+    const atLevels = keyLevels.filter(L => Math.abs(price-L.price)/price <= NEAR)
+      .sort((a,b)=>Math.abs(price-a.price)-Math.abs(price-b.price));
+    const srStr = atLevels.length
+      ? atLevels.map(L=>`${L.name} $${L.price.toFixed(0)} (${L.weight}, ${((price-L.price)/L.price*100).toFixed(2)}% away)`).join('; ')
+      : null;
+
     const candleStr = times.slice(-60).map((t,j)=>{
       const idx = times.length-60+j;
       return `${new Date(t*1000).toISOString().slice(5,16)} O${k.data.open[idx]} H${highs[idx]} L${lows[idx]} C${closes[idx]}`;
     }).join('\n');
 
-    const prompt = `You are a chart-pattern swing trader on ${bot.symbol} ${bot.decisionTf}. You trade: ascending/descending wedges, bull/bear flags, head & shoulders, inverse H&S, channels, and breaks of daily/weekly support/resistance. Be selective — most candles deserve "hold".
+    const prompt = `You are a chart-pattern swing trader on ${bot.symbol} ${bot.decisionTf}. You trade: ascending/descending wedges, bull/bear flags, head & shoulders, inverse H&S, channels, swing failure patterns (SFP), and breaks of daily/weekly support/resistance. Be selective — most candles deserve "hold".
+
+An SFP (swing failure pattern) is when price wicks BEYOND a prior swing high/low but CLOSES back inside it — a failed breakout that sweeps liquidity and often reverses. A bearish SFP (wick above a swing high, close below) favours shorts; a bullish SFP (wick below a swing low, close above) favours longs. SFPs are higher-conviction when the wick is a clean sweep and the close is decisively back inside.
 
 CURRENT PRICE: $${price}
 EQUITY: $${aiEquity(bot).toFixed(2)} ${bot.paper?'(PAPER MODE)':''}
 POSITION: ${bot.position?`${bot.position.side} @ $${bot.position.entryPrice}`:'none'}
 
+${reversals.length ? `🕯️ CANDLESTICK REVERSAL SIGNALS (confluence — weigh more when they align with an SFP sweep or a key level; higher timeframe = stronger):\n${reversals.map(r=>`${r.tf} ${r.pattern} (${r.dir})`).join('\n')}\nThese are supporting evidence for a reversal, NOT standalone triggers. A daily or weekly engulfing/star stacked with a swept level is high conviction; a lone 1h engulfing is weak.` : ''}
+
+${htfSfps.length ? `🚨🚨 HIGH-TIMEFRAME SWING FAILURE — THE MOST IMPORTANT SIGNAL ON THIS CHART, DO NOT IGNORE:\n${htfSfps.map(s=>`${s.tf} ${s.type.toUpperCase()} SFP — price swept the ${s.tf.toLowerCase()} swing ${s.type==='bearish'?'high':'low'} at $${s.level.toFixed(0)} (reached $${s.wick.toFixed(0)}, ${s.penetrationPct}% beyond) and is back ${s.type==='bearish'?'below':'above'} it at $${s.close.toFixed(0)}.`).join('\n')}\nA daily/weekly SFP is a far higher-conviction reversal signal than any intraday pattern. Give it strong weight. Still apply risk management and confirm the close holds.` : ''}
+
 PIVOTS (detected swings):
 ${pivotStr}
+
+${sfps.length ? `⚡ SWING FAILURE PATTERNS detected on the just-closed candle:\n${sfps.map(s=>`${s.type.toUpperCase()} SFP — swept the $${s.level.toFixed(0)} swing ${s.type==='bearish'?'high':'low'} (wick to $${s.wick.toFixed(0)}, ${s.penetrationPct}% beyond) then closed back at $${s.close.toFixed(0)}`).join('\n')}\nConsider whether any is a high-quality, tradeable SFP — but a detected sweep is NOT an automatic trade; weigh context, trend, and risk/reward.` : 'No swing failure pattern on the just-closed candle.'}
+
+${srStr ? `📍 PRICE IS AT STRONG SUPPORT/RESISTANCE RIGHT NOW: ${srStr}\nReversal signals (SFP, engulfing, star) are MUCH higher conviction when they occur AT these levels. A reversal candle + swept level + S/R confluence is a prime setup. A reversal in the middle of nowhere (not near any level) is weak — prefer to wait.` : 'Price is not currently at a major S/R level — reversal signals here carry less weight; be more cautious.'}
 
 KEY LEVELS: prev daily H $${dHigh?.toFixed(0)} L $${dLow?.toFixed(0)} | weekly H $${wHigh?.toFixed(0)} L $${wLow?.toFixed(0)}
 
@@ -1075,449 +991,7 @@ Respond ONLY JSON:
   }catch(e){ aiBotLog(bot,`tick error: ${e.message}`,'err'); }
 }
 
-setInterval(davidTick, 12000);
 setInterval(patternTick, 13000);
-
-// ═══ SELF-OPTIMIZATION: Claude + backtester loop (as in Davidd's video) ═══
-function fetchYahoo(ySymbol, interval='60m', range='730d'){
-  // Yahoo Finance unofficial chart API — free, no key. Needs a browser UA.
-  return new Promise((resolve)=>{
-    const path = `/v8/finance/chart/${encodeURIComponent(ySymbol)}?interval=${interval}&range=${range}`;
-    https.get({ hostname:'query1.finance.yahoo.com', path,
-      headers:{'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'} }, res=>{
-      let data=''; res.on('data',d=>data+=d);
-      res.on('end',()=>{
-        try{
-          const j = JSON.parse(data);
-          const r = j.chart && j.chart.result && j.chart.result[0];
-          if(!r || !r.timestamp) return resolve(null);
-          const q = r.indicators.quote[0];
-          const out = {time:[],open:[],high:[],low:[],close:[]};
-          for(let i=0;i<r.timestamp.length;i++){
-            if(q.open[i]==null||q.high[i]==null||q.low[i]==null||q.close[i]==null) continue;
-            out.time.push(r.timestamp[i]);
-            out.open.push(+q.open[i]); out.high.push(+q.high[i]);
-            out.low.push(+q.low[i]);   out.close.push(+q.close[i]);
-          }
-          resolve(out.time.length ? out : null);
-        }catch(e){ resolve(null); }
-      });
-    }).on('error',()=>resolve(null));
-  });
-}
-
-async function fetchHistory(symbol, interval, targetBars){
-  // page backwards with end= to accumulate up to targetBars candles
-  let all = {time:[],open:[],high:[],low:[],close:[]};
-  let end = Math.floor(Date.now()/1000);
-  for(let page=0; page<4 && all.time.length<targetBars; page++){
-    const k = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${interval}&limit=2000&end=${end}`);
-    if(!k || !k.success || !k.data.time.length) break;
-    all = {
-      time:[...k.data.time.map(Number), ...all.time],
-      open:[...k.data.open.map(Number), ...all.open],
-      high:[...k.data.high.map(Number), ...all.high],
-      low:[...k.data.low.map(Number), ...all.low],
-      close:[...k.data.close.map(Number), ...all.close],
-    };
-    end = k.data.time[0] - 1;
-    await new Promise(r=>setTimeout(r,400)); // be nice to the rate limit
-  }
-  return all;
-}
-
-// ── Strategy archetypes: each returns 'long' | 'short' | null at bar i ──
-// ctx = {closes, highs, lows, emaF, emaS, adx, rsi, atr, bbU, bbL, bbW, donHi, donLo}
-const STRATEGIES = {
-  trend: {
-    desc: 'EMA cross + ADX regime + RSI band',
-    params: {emaFast:[5,50], emaSlow:[20,200], adxMin:[15,40], rsiLow:[10,45], rsiHigh:[55,90], atrSL:[1,4], atrTP:[1.5,8]},
-    signal(ctx, P, i){
-      if(ctx.adx[i] <= P.adxMin) return null;
-      const xUp = ctx.emaF[i]>ctx.emaS[i] && ctx.emaF[i-1]<=ctx.emaS[i-1];
-      const xDn = ctx.emaF[i]<ctx.emaS[i] && ctx.emaF[i-1]>=ctx.emaS[i-1];
-      if(xUp && ctx.rsi[i]>50 && ctx.rsi[i]<P.rsiHigh) return 'long';
-      if(xDn && ctx.rsi[i]<50 && ctx.rsi[i]>P.rsiLow) return 'short';
-      return null;
-    },
-  },
-  donchian: {
-    desc: 'Donchian channel breakout with ADX filter',
-    params: {donLen:[10,100], adxMin:[15,40], atrSL:[1,4], atrTP:[1.5,8]},
-    signal(ctx, P, i){
-      if(ctx.adx[i] <= P.adxMin) return null;
-      if(ctx.closes[i] > ctx.donHi[i-1]) return 'long';
-      if(ctx.closes[i] < ctx.donLo[i-1]) return 'short';
-      return null;
-    },
-  },
-  meanrev: {
-    desc: 'RSI mean reversion in low-ADX chop',
-    params: {rsiOS:[10,35], rsiOB:[65,90], adxMax:[15,35], atrSL:[1,4], atrTP:[1.5,8]},
-    signal(ctx, P, i){
-      if(ctx.adx[i] >= P.adxMax) return null; // only trade chop
-      if(ctx.rsi[i-1] < P.rsiOS && ctx.rsi[i] >= P.rsiOS) return 'long';
-      if(ctx.rsi[i-1] > P.rsiOB && ctx.rsi[i] <= P.rsiOB) return 'short';
-      return null;
-    },
-  },
-  squeeze: {
-    desc: 'Bollinger squeeze → expansion breakout',
-    params: {bbLen:[10,40], bbMult:[1.5,3], squeezePct:[20,70], atrSL:[1,4], atrTP:[1.5,8]},
-    signal(ctx, P, i){
-      // squeeze: bandwidth in the lowest squeezePct% of last 100 bars, then close breaks a band
-      const lookback = 100;
-      if(i < lookback) return null;
-      const ws = [];
-      for(let j=i-lookback;j<i;j++) ws.push(ctx.bbW[j]);
-      ws.sort((a,b)=>a-b);
-      const thresh = ws[Math.floor(ws.length*P.squeezePct/100)];
-      if(ctx.bbW[i-1] > thresh) return null;
-      if(ctx.closes[i] > ctx.bbU[i]) return 'long';
-      if(ctx.closes[i] < ctx.bbL[i]) return 'short';
-      return null;
-    },
-  },
-};
-
-function buildCtx(h, P){
-  const closes=h.close, highs=h.high, lows=h.low;
-  const ctx = { closes, highs, lows,
-    emaF: calcEma(closes, P.emaFast||21), emaS: calcEma(closes, P.emaSlow||55),
-    adx: calcAdx(highs,lows,closes,14).adx,
-    rsi: calcRsi(closes,14),
-    atr: calcAtr(highs,lows,closes,14),
-  };
-  // Bollinger
-  const len = P.bbLen||20, mult = P.bbMult||2;
-  const sma = calcSma(closes,len);
-  ctx.bbU=[]; ctx.bbL=[]; ctx.bbW=[];
-  for(let i=0;i<closes.length;i++){
-    if(sma[i]==null){ ctx.bbU.push(closes[i]); ctx.bbL.push(closes[i]); ctx.bbW.push(0); continue; }
-    let v=0; for(let j=i-len+1;j<=i;j++) v+=(closes[j]-sma[i])**2;
-    const sd=Math.sqrt(v/len);
-    ctx.bbU.push(sma[i]+mult*sd); ctx.bbL.push(sma[i]-mult*sd);
-    ctx.bbW.push(sma[i]?2*mult*sd/sma[i]:0);
-  }
-  // Donchian
-  const dl = P.donLen||20;
-  ctx.donHi=[]; ctx.donLo=[];
-  for(let i=0;i<closes.length;i++){
-    const a=Math.max(0,i-dl+1);
-    let hi=-Infinity, lo=Infinity;
-    for(let j=a;j<=i;j++){ hi=Math.max(hi,highs[j]); lo=Math.min(lo,lows[j]); }
-    ctx.donHi.push(hi); ctx.donLo.push(lo);
-  }
-  return ctx;
-}
-
-// Regime tag from a 200-bar EMA slope (normalized %/bar): bull / bear / chop.
-function marketPhaseSeries(closes){
-  const ema = calcEma(closes, 200);
-  const phase = new Array(closes.length).fill('chop');
-  for(let i=1;i<closes.length;i++){
-    const slopePct = (ema[i]-ema[i-1])/(ema[i-1]||1)*100;
-    // ~0.02%/hr ≈ ~3.5%/week trend threshold
-    phase[i] = slopePct > 0.02 ? 'bull' : slopePct < -0.02 ? 'bear' : 'chop';
-  }
-  return phase;
-}
-
-function backtestStrategy(h, stratName, P, fromIdx, toIdx, recordCurve){
-  const strat = STRATEGIES[stratName] || STRATEGIES.trend;
-  const ctx = buildCtx(h, P);
-  const closes=h.close, highs=h.high, lows=h.low;
-  const phaseSeries = recordCurve ? marketPhaseSeries(closes) : null;
-  const FEE=0.0006, SLIP=0.0002;
-  let equity=1, peak=1, maxDd=0, wins=0, losses=0, gross=0, grossLoss=0;
-  let pos=null;
-  const curve=[];
-  const phaseTrades = recordCurve ? {bull:{w:0,l:0,net:0}, bear:{w:0,l:0,net:0}, chop:{w:0,l:0,net:0}} : null;
-  const warm = Math.max(P.emaSlow||55, P.donLen||0, P.bbLen||0, 110);
-  const start = Math.max(fromIdx, warm), end = Math.min(toIdx, closes.length);
-
-  for(let i=start;i<end;i++){
-    if(pos){
-      const slHit = pos.side===1 ? lows[i]<=pos.sl : highs[i]>=pos.sl;
-      const tpHit = pos.side===1 ? highs[i]>=pos.tp : lows[i]<=pos.tp;
-      let exitPrice=null;
-      if(slHit) exitPrice=pos.sl;
-      else if(tpHit) exitPrice=pos.tp;
-      else {
-        const r1=Math.abs(pos.entry-pos.origSl);
-        if(pos.sl!==pos.entry){
-          if(pos.side===1 && highs[i]>=pos.entry+r1) pos.sl=pos.entry;
-          if(pos.side===-1 && lows[i]<=pos.entry-r1) pos.sl=pos.entry;
-        }
-      }
-      if(exitPrice!=null){
-        const ret = (exitPrice-pos.entry)/pos.entry*pos.side - FEE - SLIP;
-        equity *= (1+ret);
-        if(ret>0){ wins++; gross+=ret; } else { losses++; grossLoss+=Math.abs(ret); }
-        if(recordCurve){ const ph=(phaseSeries[pos.entryIdx]||'chop'); const pt=phaseTrades[ph]; if(ret>0)pt.w++;else pt.l++; pt.net+=ret; }
-        peak=Math.max(peak,equity); maxDd=Math.max(maxDd,(peak-equity)/peak);
-        pos=null;
-      }
-    } else {
-      const sig = strat.signal(ctx, P, i);
-      if(sig){
-        const dir = sig==='long'?1:-1;
-        pos={side:dir, entry:closes[i], entryIdx:i,
-             sl:closes[i]-dir*P.atrSL*ctx.atr[i], origSl:closes[i]-dir*P.atrSL*ctx.atr[i],
-             tp:closes[i]+dir*P.atrTP*ctx.atr[i]};
-      }
-    }
-    if(recordCurve && (i-start)%Math.max(1,Math.floor((end-start)/150))===0)
-      curve.push({i, t:h.time[i], eq:+equity.toFixed(4), phase:phaseSeries[i]});
-  }
-  const trades=wins+losses;
-  // Per-phase trade outcome split (only meaningful when curve recorded)
-  let phaseBreakdown = null;
-  if(recordCurve && phaseTrades){
-    phaseBreakdown = {};
-    for(const ph of ['bull','bear','chop']){
-      const pt = phaseTrades[ph];
-      phaseBreakdown[ph] = { trades: pt.w+pt.l, winRate: (pt.w+pt.l)?+(100*pt.w/(pt.w+pt.l)).toFixed(1):0, netPct:+(pt.net*100).toFixed(2) };
-    }
-  }
-  return {
-    trades, winRate: trades?+(100*wins/trades).toFixed(1):0,
-    netPct:+((equity-1)*100).toFixed(2),
-    maxDdPct:+(maxDd*100).toFixed(2),
-    profitFactor: grossLoss>0?+(gross/grossLoss).toFixed(2):(gross>0?99:0),
-    curve, phaseBreakdown,
-  };
-}
-
-function backtestDavidd(h, P){
-  const closes=h.close, highs=h.high, lows=h.low;
-  const emaF=calcEma(closes,P.emaFast), emaS=calcEma(closes,P.emaSlow);
-  const {adx}=calcAdx(highs,lows,closes,14);
-  const rsi=calcRsi(closes,14);
-  const atr=calcAtr(highs,lows,closes,14);
-  const FEE=0.0006, SLIP=0.0002; // round-trip taker fees + slippage
-  let equity=1, peak=1, maxDd=0, wins=0, losses=0, gross=0, grossLoss=0;
-  let pos=null;
-  const warm = Math.max(P.emaSlow, 30);
-
-  for(let i=warm;i<closes.length;i++){
-    if(pos){
-      // intrabar SL/TP check (SL first — conservative)
-      const slHit = pos.side===1 ? lows[i]<=pos.sl : highs[i]>=pos.sl;
-      const tpHit = pos.side===1 ? highs[i]>=pos.tp : lows[i]<=pos.tp;
-      let exitPrice=null, win=null;
-      if(slHit){ exitPrice=pos.sl; win=false; }
-      else if(tpHit){ exitPrice=pos.tp; win=true; }
-      else {
-        // break-even at +1R
-        const r1=Math.abs(pos.entry-pos.origSl);
-        if(pos.sl!==pos.entry){
-          if(pos.side===1 && highs[i]>=pos.entry+r1) pos.sl=pos.entry;
-          if(pos.side===-1 && lows[i]<=pos.entry-r1) pos.sl=pos.entry;
-        }
-      }
-      if(exitPrice!=null){
-        const ret = (exitPrice-pos.entry)/pos.entry*pos.side - FEE - SLIP;
-        equity *= (1+ret);
-        if(ret>0){ wins++; gross+=ret; } else { losses++; grossLoss+=Math.abs(ret); }
-        peak=Math.max(peak,equity); maxDd=Math.max(maxDd,(peak-equity)/peak);
-        pos=null;
-      }
-      continue;
-    }
-    const regime = adx[i]>P.adxMin;
-    const longX  = emaF[i]>emaS[i] && emaF[i-1]<=emaS[i-1];
-    const shortX = emaF[i]<emaS[i] && emaF[i-1]>=emaS[i-1];
-    if(regime && longX && rsi[i]>50 && rsi[i]<P.rsiHigh){
-      pos={side:1, entry:closes[i], sl:closes[i]-P.atrSL*atr[i], origSl:closes[i]-P.atrSL*atr[i], tp:closes[i]+P.atrTP*atr[i]};
-    } else if(regime && shortX && rsi[i]<50 && rsi[i]>P.rsiLow){
-      pos={side:-1, entry:closes[i], sl:closes[i]+P.atrSL*atr[i], origSl:closes[i]+P.atrSL*atr[i], tp:closes[i]-P.atrTP*atr[i]};
-    }
-  }
-  const trades=wins+losses;
-  return {
-    trades, winRate: trades?+(100*wins/trades).toFixed(1):0,
-    netPct:+((equity-1)*100).toFixed(2),
-    maxDdPct:+(maxDd*100).toFixed(2),
-    profitFactor: grossLoss>0?+(gross/grossLoss).toFixed(2):(gross>0?99:0),
-  };
-}
-
-// Wishlist: top 3 crypto + top 8 stock futures (indices + megacaps) + gold/silver/oil.
-// Each entry lists candidate MEXC symbol spellings; we use whichever actually exists.
-const MARKET_WISHLIST = [
-  {label:'BTC',     candidates:['BTC_USDT']},
-  {label:'ETH',     candidates:['ETH_USDT']},
-  {label:'SOL',     candidates:['SOL_USDT']},
-  {label:'S&P500',  candidates:['SP500_USDT','SPX500_USDT','SPX_USDT'], yahoo:'ES=F'},
-  {label:'NASDAQ',  candidates:['NAS100_USDT','NASDAQ_USDT','NDX_USDT'], yahoo:'NQ=F'},
-  {label:'DOW',     candidates:['US30_USDT','DJ30_USDT'], yahoo:'YM=F'},
-  {label:'TESLA',   candidates:['TSLA_USDT','TSLAX_USDT'], yahoo:'TSLA'},
-  {label:'NVIDIA',  candidates:['NVDA_USDT','NVDAX_USDT'], yahoo:'NVDA'},
-  {label:'APPLE',   candidates:['AAPL_USDT','AAPLX_USDT'], yahoo:'AAPL'},
-  {label:'AMD',     candidates:['AMD_USDT','AMDX_USDT'], yahoo:'AMD'},
-  {label:'MICROSOFT',candidates:['MSFT_USDT','MSFTX_USDT'], yahoo:'MSFT'},
-  {label:'GOLD',    candidates:['GOLD_USDT','XAU_USDT','XAUT_USDT','PAXG_USDT'], yahoo:'GC=F'},
-  {label:'SILVER',  candidates:['SILVER_USDT','XAG_USDT'], yahoo:'SI=F'},
-  {label:'OIL',     candidates:['OIL_USDT','USOIL_USDT','WTI_USDT','CL_USDT'], yahoo:'CL=F'},
-];
-
-function resolveMarkets(){
-  const out = [];
-  for(const w of MARKET_WISHLIST){
-    const sym = w.candidates.find(c=>CONTRACTS[c]);
-    if(sym) out.push({label:w.label, symbol:sym, yahoo:w.yahoo||null});
-  }
-  return out;
-}
-let optimizer = { running:false, iter:0, total:0, results:[], best:null, log:[], symbol:'multi', tf:'Min60' };
-
-async function runOptimizer(iterations, symbol, tf){
-  optimizer = { running:true, iter:0, total:iterations, results:[], best:null, log:[], symbol:'multi', tf };
-  try{
-    if(!Object.keys(CONTRACTS).length) await refreshContracts();
-    const markets = resolveMarkets();
-    if(!markets.length) throw new Error('no markets resolved from MEXC contract list');
-    optimizer.log.push(`Markets resolved on MEXC: ${markets.map(m=>`${m.label}=${m.symbol}`).join(', ')}`);
-    blog(`🔁 OPTIMIZER started — ${iterations} iters across ${markets.length} markets [${tf}]`,'ok');
-    sendTelegram(`🔁 <b>Self-optimization started</b>\n${iterations} iterations · ${markets.length} markets (crypto+indices+stocks+metals+oil) · 4 strategies · OOS validated`);
-
-    // fetch all market histories once.
-    // Crypto: MEXC (execution venue, ~11mo). Stocks/indices/metals/oil: Yahoo
-    // gives ~2 YEARS of hourly bars vs months on the newly-listed MEXC perps.
-    const hists = {};
-    const SYMBOLS = [];
-    for(const m of markets){
-      let h = null, src = 'MEXC';
-      if(m.yahoo){
-        h = await fetchYahoo(m.yahoo, '60m', '730d');
-        src = 'Yahoo:'+m.yahoo;
-        await new Promise(r=>setTimeout(r,300));
-      }
-      if(!h || h.time.length < 600){
-        const hm = await fetchHistory(m.symbol, tf, 6000);
-        if(hm.time.length > (h?h.time.length:0)){ h = hm; src = 'MEXC'; }
-      }
-      if(h && h.time.length > 600){
-        hists[m.symbol] = h; SYMBOLS.push(m.symbol);
-        optimizer.log.push(`${m.label} (${m.symbol}): ${h.time.length} bars [${src}]`);
-      } else {
-        optimizer.log.push(`${m.label} (${m.symbol}): insufficient data — skipped`);
-      }
-    }
-    if(!SYMBOLS.length) throw new Error('no usable history');
-
-    const runOOS = (sym, strat, P)=>{
-      const h = hists[sym];
-      const split = Math.floor(h.close.length*0.7);
-      const train = backtestStrategy(h, strat, P, 0, split, true);
-      const test  = backtestStrategy(h, strat, P, split, h.close.length, true);
-      return { train, test, splitTime: h.time[split] };
-    };
-
-    // Seed: current bot config on the first available market
-    const seedSym = hists['BTC_USDT'] ? 'BTC_USDT' : SYMBOLS[0];
-    const seedP = Object.assign({}, aiBots.davidd.params);
-    const seed = runOOS(seedSym,'trend',seedP);
-    optimizer.results.push({symbol:seedSym, strategy:'trend', params:seedP,
-      trainNet:seed.train.netPct, testNet:seed.test.netPct,
-      trainPf:seed.train.profitFactor, testPf:seed.test.profitFactor,
-      testDd:seed.test.maxDdPct, trades:seed.train.trades+seed.test.trades,
-      curve:[...seed.train.curve, ...seed.test.curve.map(p=>({...p, eq:+(p.eq*seed.train.curve[seed.train.curve.length-1]?.eq||1).toFixed(4)}))],
-      splitTime:seed.splitTime, note:'current settings', phaseBreakdown: seed.test.phaseBreakdown});
-    optimizer.best = optimizer.results[0];
-
-    const stratDescs = Object.entries(STRATEGIES).map(([k,v])=>`${k}: ${v.desc} | params: ${JSON.stringify(v.params)}`).join('\n');
-    // OOS-first scoring: test segment is what matters
-    const score = r => (r.trades<30) ? -999 :
-      (r.testPf||0)*2 + (r.testNet||0)/40 - (r.testDd||0)/25 + Math.min((r.trainPf||0),3)*0.5;
-
-    for(let it=1; it<=iterations && optimizer.running; it++){
-      optimizer.iter = it;
-      const history = optimizer.results.slice(-12).map(r=>
-        `${r.symbol} ${r.strategy} ${JSON.stringify(r.params)} → TRAIN net:${r.trainNet}% pf:${r.trainPf} | TEST net:${r.testNet}% pf:${r.testPf} dd:${r.testDd}% (${r.trades}t)`).join('\n');
-
-      const prompt = `You are searching for the most ROBUSTLY profitable crypto futures strategy. Backtests use 70% train / 30% TEST split — only TEST performance proves robustness; big train/test divergence = overfitting, avoid it.
-
-MARKETS (all live-tradeable MEXC perpetuals): ${SYMBOLS.join(', ')}
-Notes: stock/index/metal backtests use ~2yr Yahoo Finance hourly data (underlying market); execution happens on the matching MEXC perp. Session gaps exist in non-crypto data. Crypto uses MEXC's own 24/7 candles.
-STRATEGY TYPES:
-${stratDescs}
-All strategies use ATR-based SL/TP with break-even at +1R.
-
-RESULTS SO FAR:
-${history}
-
-BEST SO FAR: ${optimizer.best.symbol} ${optimizer.best.strategy} ${JSON.stringify(optimizer.best.params)} → TEST net ${optimizer.best.testNet}% pf ${optimizer.best.testPf}
-
-Propose the next candidate. Explore different assets and strategy types early, refine winners later. Respond ONLY JSON:
-{"symbol":"one of the assets","strategy":"trend|donchian|meanrev|squeeze","params":{...appropriate params...},"hypothesis":"one sentence"}`;
-
-      let prop;
-      try{
-        const raw = await callClaude(prompt);
-        prop = JSON.parse(raw.replace(/```json|```/g,'').trim());
-      }catch(e){ optimizer.log.push(`iter ${it}: Claude error — ${e.message}`); continue; }
-
-      const sym = SYMBOLS.includes(prop.symbol) ? prop.symbol : SYMBOLS[0];
-      const stratName = STRATEGIES[prop.strategy] ? prop.strategy : 'trend';
-      // sanitize params against the strategy's declared ranges
-      const P = {};
-      const ranges = STRATEGIES[stratName].params;
-      for(const [k,[lo,hi]] of Object.entries(ranges)){
-        let v = +((prop.params||{})[k]);
-        if(isNaN(v)) v = (lo+hi)/2;
-        P[k] = Math.max(lo, Math.min(hi, v));
-        if(['emaFast','emaSlow','donLen','bbLen'].includes(k)) P[k]=Math.round(P[k]);
-      }
-      if(P.emaSlow != null && P.emaFast != null && P.emaSlow <= P.emaFast) P.emaSlow = P.emaFast+10;
-
-      const r = runOOS(sym, stratName, P);
-      const lastTrainEq = r.train.curve.length ? r.train.curve[r.train.curve.length-1].eq : 1;
-      const entry = {
-        symbol:sym, strategy:stratName, params:P,
-        trainNet:r.train.netPct, testNet:r.test.netPct,
-        trainPf:r.train.profitFactor, testPf:r.test.profitFactor,
-        testDd:r.test.maxDdPct, trades:r.train.trades+r.test.trades,
-        curve:[...r.train.curve, ...r.test.curve.map(p=>({...p, eq:+(p.eq*lastTrainEq).toFixed(4)}))],
-        splitTime:r.splitTime, note:prop.hypothesis,
-        phaseBreakdown: r.test.phaseBreakdown, // bull/bear/chop on the out-of-sample segment
-      };
-      optimizer.results.push(entry);
-      if(score(entry) > score(optimizer.best)) optimizer.best = entry;
-      optimizer.log.push(`iter ${it}: ${sym} ${stratName} → TEST net ${r.test.netPct}% pf ${r.test.profitFactor} (train ${r.train.netPct}%) — ${prop.hypothesis}`);
-    }
-    const b = optimizer.best;
-    blog(`🔁 OPTIMIZER done — best: ${b.symbol} ${b.strategy} → TEST net ${b.testNet}% pf ${b.testPf}`,'ok');
-    sendTelegram(`✅ <b>Optimization complete</b>\nBest: ${b.symbol} <b>${b.strategy}</b>\nTRAIN net ${b.trainNet}% | TEST net ${b.testNet}% | TEST PF ${b.testPf} | DD ${b.testDd}%\n<code>${JSON.stringify(b.params)}</code>\nIf TEST ≪ TRAIN, it's overfit — don't apply.`);
-  }catch(e){
-    blog(`Optimizer error: ${e.message}`,'err');
-    optimizer.log.push('FATAL: '+e.message);
-  }
-  optimizer.running=false;
-}
-
-// For each regime, pick the result with the best OOS net% IN THAT REGIME
-// (requiring a minimum number of in-regime trades so it isn't noise).
-function buildRegimeMap(){
-  const out = { bull:null, bear:null, chop:null };
-  const best = { bull:-1e9, bear:-1e9, chop:-1e9 };
-  for(const r of optimizer.results){
-    const pb = r.phaseBreakdown;
-    if(!pb) continue;
-    for(const regime of ['bull','bear','chop']){
-      const seg = pb[regime];
-      if(!seg || seg.trades < 8) continue;       // need real activity in-regime
-      if(seg.netPct <= 0) continue;              // must be profitable in-regime
-      if(seg.netPct > best[regime]){
-        best[regime] = seg.netPct;
-        out[regime] = { strategy:r.strategy, params:r.params, symbol:r.symbol,
-                        regimeNet:seg.netPct, regimeWin:seg.winRate, regimeTrades:seg.trades };
-      }
-    }
-  }
-  return out;
-}
 
 // ─────────────────────────────────────────────────────────────
 // HTTP SERVER
@@ -1784,12 +1258,11 @@ http.createServer(async (req, res)=>{
     return json(res,200, savedChartLines[symbol] || null);
   }
 
-  // ── AI BOTS v2 endpoints ──
-  if(url.match(/^\/ai2\/(pattern|davidd)\/start$/) && req.method==='POST'){
-    const name = url.split('/')[2];
-    const bot = aiBots[name];
+  // ── PATTERN BOT endpoints ──
+  if(url==='/ai2/pattern/start' && req.method==='POST'){
+    const bot = aiBots.pattern;
     const b = await readBody(req);
-    if(name==='pattern' && !ANTHROPIC_KEY) return json(res,400,{error:'Pattern bot needs ANTHROPIC_API_KEY in Railway'});
+    if(!ANTHROPIC_KEY) return json(res,400,{error:'Pattern bot needs ANTHROPIC_API_KEY in Railway'});
     bot.enabled = true;
     bot.paper = b.paper !== false; // default paper
     bot.allocation = parseFloat(b.allocation)||100;
@@ -1797,80 +1270,25 @@ http.createServer(async (req, res)=>{
     bot.decisionTf = b.decisionTf || 'Min60';
     bot.symbol = b.symbol || 'BTC_USDT';
     if(b.lineSource) bot.lineSource = b.lineSource;
-    if(b.aiSupervisor != null) bot.aiSupervisor = !!b.aiSupervisor;
     bot.lastDecisionCandle = null;
-    blog(`🧠 AI [${name}] STARTED — $${bot.allocation} ${bot.paper?'PAPER':'LIVE'} [${bot.decisionTf}]${name==='pattern'?' lines:'+bot.lineSource:''}${name==='davidd'?' supervisor:'+(bot.aiSupervisor?'on':'off'):''}`,'ok');
-    sendTelegram(`🧠 <b>AI ${name} bot started</b>\n$${bot.allocation} ${bot.paper?'📝 paper':'💸 LIVE'} | ${bot.decisionTf}`);
+    blog(`🧠 PATTERN bot STARTED — $${bot.allocation} ${bot.paper?'PAPER':'LIVE'} [${bot.decisionTf}] lines:${bot.lineSource}`,'ok');
+    sendTelegram(`🧠 <b>Pattern bot started</b>\n$${bot.allocation} ${bot.paper?'📝 paper':'💸 LIVE'} | ${bot.decisionTf}`);
     return json(res,200,{started:true});
   }
-  if(url.match(/^\/ai2\/(pattern|davidd)\/stop$/) && req.method==='POST'){
-    const bot = aiBots[url.split('/')[2]];
-    bot.enabled = false;
-    blog(`🧠 AI [${bot.name}] stopped`,'warn');
+  if(url==='/ai2/pattern/stop' && req.method==='POST'){
+    aiBots.pattern.enabled = false;
+    blog(`🧠 PATTERN bot stopped`,'warn');
     return json(res,200,{stopped:true});
   }
-  if(url.match(/^\/ai2\/(pattern|davidd)\/status$/)){
-    const bot = aiBots[url.split('/')[2]];
+  if(url==='/ai2/pattern/status'){
+    const bot = aiBots.pattern;
     return json(res,200,{
       enabled: bot.enabled, paper: bot.paper, hasApiKey: !!ANTHROPIC_KEY,
       allocation: bot.allocation, realizedPnl: bot.realizedPnl,
       position: bot.position, decisions: bot.decisions.slice(-12),
       tradeHistory: bot.tradeHistory.slice(-10), decisionTf: bot.decisionTf,
-      lineSource: bot.lineSource, aiSupervisor: bot.aiSupervisor,
-      aiLines: bot.aiLines,
-      params: bot.params,
-      strategy: bot.strategy||'trend',
-      regimeMap: bot.regimeMap||null,
+      lineSource: bot.lineSource, aiLines: bot.aiLines,
     });
-  }
-
-  // ── OPTIMIZER endpoints ──
-  if(url==='/ai2/optimize/start' && req.method==='POST'){
-    if(!ANTHROPIC_KEY) return json(res,400,{error:'Needs ANTHROPIC_API_KEY'});
-    if(optimizer.running) return json(res,409,{error:'Already running'});
-    const b = await readBody(req);
-    const iters = Math.min(30, Math.max(3, parseInt(b.iterations)||15));
-    runOptimizer(iters, b.symbol||'BTC_USDT', b.tf||'Min60'); // fire & forget
-    return json(res,200,{started:true, iterations:iters});
-  }
-  if(url==='/ai2/optimize/stop' && req.method==='POST'){
-    optimizer.running=false;
-    return json(res,200,{stopped:true});
-  }
-  if(url==='/ai2/optimize/status'){
-    const sc = r => (r.trades<30) ? -999 : (r.testPf||0)*2 + (r.testNet||0)/40 - (r.testDd||0)/25 + Math.min((r.trainPf||0),3)*0.5;
-    const strip = r => { if(!r) return r; const {curve, ...rest} = r; return rest; };
-    const top = optimizer.results.slice().sort((a,b)=>sc(b)-sc(a)).slice(0,3).map(strip);
-    return json(res,200,{
-      running: optimizer.running, iter: optimizer.iter, total: optimizer.total,
-      best: optimizer.best ? Object.assign(strip(optimizer.best), {curve: optimizer.best.curve, splitTime: optimizer.best.splitTime}) : null,
-      top3: top, log: optimizer.log.slice(-15),
-      currentParams: aiBots.davidd.params, currentStrategy: aiBots.davidd.strategy||'trend',
-      regimeMap: buildRegimeMap(), activeRegimeMap: aiBots.davidd.regimeMap||null,
-    });
-  }
-  if(url==='/ai2/optimize/apply' && req.method==='POST'){
-    if(!optimizer.best) return json(res,400,{error:'no results yet'});
-    const b = optimizer.best;
-    aiBots.davidd.params = Object.assign({}, b.params);
-    aiBots.davidd.strategy = b.strategy || 'trend';
-    aiBots.davidd.symbol = b.symbol || 'BTC_USDT';
-    aiBots.davidd.regimeMap = null; // single-strategy mode
-    blog(`✅ Applied (single strategy) to davidd: ${b.symbol} ${b.strategy} ${JSON.stringify(b.params)}`,'ok');
-    sendTelegram(`✅ <b>Optimized strategy applied</b>\n${b.symbol} <b>${b.strategy}</b>\n<code>${JSON.stringify(b.params)}</code>`);
-    return json(res,200,{applied:true, strategy:b.strategy, symbol:b.symbol, params: aiBots.davidd.params});
-  }
-  if(url==='/ai2/optimize/apply-regime' && req.method==='POST'){
-    const map = buildRegimeMap();
-    if(!map || (!map.bull && !map.bear && !map.chop)) return json(res,400,{error:'not enough regime data yet — run more iterations'});
-    aiBots.davidd.regimeMap = map;
-    // symbol: use the bull pick's symbol (or any assigned), bot trades one symbol
-    const anySym = (map.bull||map.bear||map.chop).symbol;
-    aiBots.davidd.symbol = anySym;
-    const summary = ['bull','bear','chop'].map(r=>map[r]?`${r}→${map[r].strategy}`:`${r}→flat`).join(', ');
-    blog(`✅ Applied REGIME MAP to davidd (${anySym}): ${summary}`,'ok');
-    sendTelegram(`✅ <b>Adaptive regime map applied</b>\n${anySym}\n${summary}\n<i>Bot switches strategy by live 200-EMA regime.</i>`);
-    return json(res,200,{applied:true, symbol:anySym, regimeMap:map});
   }
 
   if(url==='/logs'){
@@ -1990,42 +1408,6 @@ http.createServer(async (req, res)=>{
       return json(res,200,{closed:true, vol});
     }
     return json(res,500,r);
-  }
-
-  // ── AI TRADER ──
-  if(url==='/ai/start' && req.method==='POST'){
-    if(!ANTHROPIC_KEY) return json(res,400,{error:'Set ANTHROPIC_API_KEY env var in Railway first'});
-    const b = await readBody(req);
-    aiTrader.enabled = true;
-    aiTrader.symbol = b.symbol || 'BTC_USDT';
-    aiTrader.allocatedUsd = parseFloat(b.allocation) || 100;
-    aiTrader.startBalance = aiTrader.allocatedUsd + aiTrader.realizedPnl;
-    aiTrader.decisionTf = b.decisionTf || 'Min60';
-    aiTrader.lastDecisionCandle = null;
-    blog(`🧠 AI TRADER STARTED — $${aiTrader.allocatedUsd} allocation, decisions every ${aiTrader.decisionTf} candle`,'ok');
-    sendTelegram(`🧠 <b>AI Trader started</b>\nAllocation: $${aiTrader.allocatedUsd}\nDecision cadence: ${aiTrader.decisionTf}\nMax leverage: ${aiTrader.maxLeverage}x | Kill switch: -${aiTrader.killSwitchPct}%`);
-    return json(res,200,{started:true});
-  }
-
-  if(url==='/ai/stop' && req.method==='POST'){
-    aiTrader.enabled = false;
-    blog('🧠 AI Trader stopped','warn');
-    sendTelegram('🛑 <b>AI Trader stopped</b>');
-    return json(res,200,{stopped:true});
-  }
-
-  if(url==='/ai/status'){
-    return json(res,200,{
-      enabled: aiTrader.enabled,
-      hasApiKey: !!ANTHROPIC_KEY,
-      symbol: aiTrader.symbol,
-      allocation: aiTrader.allocatedUsd,
-      realizedPnl: aiTrader.realizedPnl,
-      position: aiTrader.position,
-      decisions: aiTrader.decisions.slice(-10),
-      tradeHistory: aiTrader.tradeHistory.slice(-10),
-      decisionTf: aiTrader.decisionTf,
-    });
   }
 
   json(res,404,{error:'not found'});
