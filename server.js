@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.61';
+const SERVER_BUILD = '2026-06-14.62';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -715,10 +715,12 @@ async function fetchLatestVideos(){
 // Tiny JSON GET helper
 function httpsGetJson(url){
   return new Promise((resolve,reject)=>{
-    https.get(url, res=>{
+    const req = https.get(url, res=>{
       let d=''; res.on('data',c=>d+=c);
       res.on('end',()=>{ try{ resolve(JSON.parse(d)); }catch(e){ reject(e); } });
-    }).on('error',reject);
+    });
+    req.on('error',reject);
+    req.setTimeout(8000, ()=>{ req.destroy(); reject(new Error('youtube timeout')); });
   });
 }
 
@@ -781,11 +783,13 @@ function callClaudeWithSearch(prompt, maxTokens){
           const j = JSON.parse(data);
           if(j.error) return reject(new Error(j.error.message||'API error'));
           const text = (j.content||[]).map(b=> b.type==='text' ? b.text : '').join('');
+          if(!text) return reject(new Error('empty response from model'));
           resolve(text);
         }catch(e){ reject(new Error('parse error: '+data.slice(0,200))); }
       });
     });
     req.on('error', reject);
+    req.setTimeout(90000, ()=>{ req.destroy(); reject(new Error('model call timed out (90s)')); });
     req.write(body); req.end();
   });
 }
@@ -1601,8 +1605,10 @@ http.createServer(async (req, res)=>{
   }
   if(url==='/sentiment/refresh' && req.method==='POST'){
     if(!ANTHROPIC_KEY) return json(res,400,{error:'needs ANTHROPIC_API_KEY'});
-    // Pull each analyst's LATEST video (title/description/recency) via YouTube Data API.
-    const vids = await fetchLatestVideos();
+    // Pull each analyst's LATEST video — but never let it break sentiment.
+    let vids = [];
+    try{ vids = await fetchLatestVideos(); }
+    catch(e){ blog(`Sentiment: YouTube fetch failed (continuing without it): ${e.message}`,'warn'); }
     let vidContext = '';
     if(vids.length){
       vidContext = '\n\nLATEST YOUTUBE VIDEOS (from the official YouTube Data API — use these as the most current, datable signal of each analyst\'s stance; the title and description tell you their newest framing):\n'
