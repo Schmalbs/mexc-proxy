@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.55';
+const SERVER_BUILD = '2026-06-14.58';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -212,8 +212,9 @@ async function getLastClosedCandle(symbol, interval){
   const d = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${interval}&limit=3`);
   if(!d || !d.success || !d.data || !d.data.time || d.data.time.length < 2) return null;
   const i = d.data.time.length - 2;
+  const prevClose = i>=1 ? parseFloat(d.data.close[i-1]) : null;
   return { time: parseInt(d.data.time[i]), close: parseFloat(d.data.close[i]),
-           high: parseFloat(d.data.high[i]), low: parseFloat(d.data.low[i]) };
+           high: parseFloat(d.data.high[i]), low: parseFloat(d.data.low[i]), prevClose };
 }
 
 async function getTicker(symbol){
@@ -463,9 +464,14 @@ async function runBot(bot){
     triggered = (dir==='above' && above(candle.close, tp)) || (dir==='below' && below(candle.close, tp));
     triggerLabel = `manual price ${tp}`;
   } else {
-    const lines = cfg.selectedLineId==='all'
-      ? cfg.lines
-      : cfg.lines.filter(l => String(l.id)===String(cfg.selectedLineId));
+    // 'all' is no longer offered in the UI. A legacy bot still carrying 'all'
+    // is neutralised here: we require a single explicit line. This prevents the
+    // old "fires below the highest line" trap on any bot armed before this fix.
+    if(cfg.selectedLineId==='all'){
+      retireBot(bot, `legacy "all lines" bot retired — re-arm on a single specific line`);
+      return;
+    }
+    const lines = cfg.lines.filter(l => String(l.id)===String(cfg.selectedLineId));
 
     // A trend line is only valid WITHIN its drawn segment. Beyond the last
     // drawn point, the projection would cut through unrelated S/R — so the
@@ -481,10 +487,20 @@ async function runBot(bot){
 
     for(const line of validLines){
       const lp = priceOnLine(line, candle.time);
-      if((dir==='above' && above(candle.close, lp)) || (dir==='below' && below(candle.close, lp))){
-        triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(4)}`;
-        break;
+      const closedThroughNow = (dir==='above' && above(candle.close, lp)) || (dir==='below' && below(candle.close, lp));
+      if(!closedThroughNow) continue;
+      // Require a genuine CROSSING: the prior candle must have closed on the
+      // OTHER side of the line. Without this, a bot watching a line that price
+      // is already past fires immediately (the bug that shorted above your lines).
+      if(candle.prevClose != null){
+        const wasOnOtherSide = (dir==='above') ? (candle.prevClose <= lp) : (candle.prevClose >= lp);
+        if(!wasOnOtherSide){
+          // already past this line before — not a fresh break, skip it
+          continue;
+        }
       }
+      triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(4)} (crossed from ${dir==='above'?'below':'above'})`;
+      break;
     }
   }
 
@@ -1377,11 +1393,12 @@ http.createServer(async (req, res)=>{
       saveState();
       return json(res,200,{armed: bots.length>0, removed: bot.id, totalBots: bots.length});
     }
-    // No id = disarm all
+    // No id = disarm all — full clean sweep so nothing stale lingers
     const n = bots.length;
     bots = [];
-    blog(`All ${n} bot(s) DISARMED`,'warn');
-    sendTelegram('🛑 <b>All bots disarmed</b>');
+    botIdCounter = 0;            // reset numbering — truly fresh
+    blog(`All ${n} bot(s) DISARMED — clean slate, no snapshots retained`,'warn');
+    sendTelegram(`🛑 <b>All bots disarmed</b> — ${n} cleared, clean slate.`);
     saveState();
     return json(res,200,{armed:false, totalBots: 0});
   }
