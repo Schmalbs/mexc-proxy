@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.63';
+const SERVER_BUILD = '2026-06-14.65';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -353,29 +353,63 @@ async function runBot(bot){
       ? await getTicker(cfg.symbol) : null;
 
     // ── CUSTOM EXIT RULES (plain-English rules, deterministically enforced) ──
-    // Each rule: {tf, operator:'below'|'above', level OR lineId, label}
-    // Triggers a FULL close when a candle on that TF closes past the level.
+    // Two kinds, both close-only and fully deterministic (no AI in this loop):
+    //   kind 'simple'        : {tf, operator:'below'|'above', level|lineId} → close when a candle closes past the level
+    //   kind 'failed_retest' : {tf, operator:'below'|'above', level|lineId, retestPct}
+    //        Stage 1: a candle closes PAST the level (below for 'below').
+    //        Stage 2: a LATER candle wicks back to the level (high reaches it,
+    //                 or comes within retestPct%) but CLOSES back past it again → close.
     if(Array.isArray(t.customExits) && t.customExits.length){
       t._customExitCandle = t._customExitCandle || {};
-      for(const rule of t.customExits){
+      t._retestStage = t._retestStage || {};   // per-rule: has the initial break happened?
+      for(let ri=0; ri<t.customExits.length; ri++){
+        const rule = t.customExits[ri];
         const c = await getLastClosedCandle(cfg.symbol, rule.tf);
         if(!c) continue;
-        // only evaluate once per new candle on that timeframe
-        const seenKey = rule.tf + ':' + (rule.lineId!=null?('L'+rule.lineId):rule.level);
-        if(t._customExitCandle[seenKey] === c.time) continue;
-        t._customExitCandle[seenKey] = c.time;
-        // resolve the level: explicit price, or a line value at this candle time
+        const ruleKey = (rule.kind||'simple') + ':' + ri + ':' + rule.tf + ':' + (rule.lineId!=null?('L'+rule.lineId):rule.level);
+        // evaluate each rule at most once per new candle on its timeframe
+        if(t._customExitCandle[ruleKey] === c.time) continue;
+        t._customExitCandle[ruleKey] = c.time;
+        // resolve the level (price, or line value at this candle's time)
         let lvl = rule.level;
         if(rule.lineId != null){
           const ln = (cfg.lines||[]).find(L=>String(L.id)===String(rule.lineId));
           if(ln) lvl = priceOnLine(ln, c.time);
         }
         if(lvl == null) continue;
-        const hit = rule.operator==='below' ? c.close < lvl : c.close > lvl;
-        if(hit){
-          blog(`📜 Bot #${bot.id} CUSTOM EXIT: ${rule.tf} close ${rule.operator} ${lvl.toFixed(2)} (${c.close}) — closing trade`, 'warn');
-          sendTelegram(`📜 <b>Bot #${bot.id} custom exit triggered</b>\n"${rule.label||(rule.tf+' close '+rule.operator+' '+lvl.toFixed(2))}"\nCandle closed at $${c.close} — closing position.`);
-          return exitTrade(bot, 'custom rule', c.close, t.activeTpCount||0);
+        const below = rule.operator==='below';
+        const closedPast = below ? c.close < lvl : c.close > lvl;
+
+        if((rule.kind||'simple') === 'simple'){
+          if(closedPast){
+            blog(`📜 Bot #${bot.id} CUSTOM EXIT: ${rule.tf} close ${rule.operator} ${lvl.toFixed(2)} (${c.close}) — closing`, 'warn');
+            sendTelegram(`📜 <b>Bot #${bot.id} custom exit</b>\n"${rule.label||(rule.tf+' close '+rule.operator+' '+lvl.toFixed(2))}"\nClosed at $${c.close}.`);
+            return exitTrade(bot, 'custom rule', c.close, t.activeTpCount||0);
+          }
+          continue;
+        }
+
+        if(rule.kind === 'failed_retest'){
+          const pct = (rule.retestPct != null ? rule.retestPct : 0.1) / 100;
+          // Stage 1 — wait for the initial break (a close past the level)
+          if(!t._retestStage[ruleKey]){
+            if(closedPast){
+              t._retestStage[ruleKey] = true;
+              blog(`📜 Bot #${bot.id} failed-retest rule: break confirmed (${rule.tf} closed ${rule.operator} ${lvl.toFixed(2)} @ ${c.close}). Now watching for a failed retest.`, 'info');
+            }
+            continue;
+          }
+          // Stage 2 — break already happened; look for the rejection candle:
+          // its high reached the line (or came within pct), but it closed back past.
+          const reachedLine = below
+            ? (c.high >= lvl || c.high >= lvl * (1 - pct))   // wicked up to/through, or within pct below
+            : (c.low  <= lvl || c.low  <= lvl * (1 + pct));
+          if(reachedLine && closedPast){
+            blog(`📜 Bot #${bot.id} CUSTOM EXIT: failed retest of ${lvl.toFixed(2)} — ${rule.tf} high ${c.high} reached line then closed ${rule.operator} at ${c.close}. Closing.`, 'warn');
+            sendTelegram(`📜 <b>Bot #${bot.id} failed-retest exit</b>\n"${rule.label||('failed retest of '+lvl.toFixed(2))}"\n${rule.tf} candle wicked to the line and closed ${rule.operator} ($${c.close}). Closing position.`);
+            return exitTrade(bot, 'failed retest', c.close, t.activeTpCount||0);
+          }
+          continue;
         }
       }
     }
@@ -1497,20 +1531,37 @@ http.createServer(async (req, res)=>{
     const lineList = lines.length
       ? 'Available drawn lines (use lineId if the user refers to a line): ' + lines.map(l=>`#${l.id}${l.isHoriz?` (horizontal @ ${l.horizPrice})`:' (trend line)'}`).join(', ')
       : 'No drawn lines available.';
-    const prompt = `Translate this trader's plain-English EXIT instruction into a strict JSON rule. The rule closes an open trade when a candle closes past a level.
+    const prompt = `Translate this trader's plain-English EXIT instruction into a strict JSON rule. Exit rules close an open trade. There are TWO kinds:
+
+1. SIMPLE — close when a candle closes past a level. kind:"simple".
+2. FAILED RETEST — the trader wants: price first breaks past a level (a candle closes past it), THEN later a candle wicks back to the level (its high reaches the line, or comes within a small % ) but CLOSES back past it again — a failed retest / rejection. kind:"failed_retest". Use this when the trader mentions retesting, re-testing, rejection, "comes back to the line", "fails to reclaim", or a two-step break-then-reject sequence.
 
 Trader said: "${text}"
 ${lineList}
 
-Respond ONLY with JSON, no markdown:
-{"ok":true,"tf":"Min5|Min15|Min30|Min60|Hour4|Day1","operator":"below|above","level":<number or null>,"lineId":<number or null>,"label":"<short human summary>"}
+Respond ONLY with JSON, no markdown. For a SIMPLE rule:
+{"ok":true,"kind":"simple","tf":"...","operator":"below|above","level":<number|null>,"lineId":<number|null>,"label":"..."}
+For a FAILED RETEST rule:
+{"ok":true,"kind":"failed_retest","tf":"...","operator":"below|above","level":<number|null>,"lineId":<number|null>,"retestPct":<number, default 0.1>,"label":"..."}
+
 Rules:
-- tf must be one of the exact strings listed (4h=Hour4, 1h=Min60, 15m=Min15, 5m=Min5, 30m=Min30, daily=Day1).
-- If the trader names a price, put it in "level" and set lineId null.
-- If the trader refers to a line, set "lineId" to that line's number and level null.
-- operator "below" = close below the level, "above" = close above.
-- If you cannot confidently parse it, respond {"ok":false,"reason":"<why>"}.
-- label: a short clear summary like "4h close below $63,000".`;
+- tf exact strings: 4h=Hour4, 1h=Min60, 15m=Min15, 5m=Min5, 30m=Min30, daily=Day1.
+- A price → "level" (lineId null). A drawn line → "lineId" (level null).
+- operator "below" = the break/close is below the level; "above" = above.
+- retestPct: how close the wick must come to the line to count as a retest (percent). Default 0.1 if unspecified.
+
+STRICT — DO NOT GUESS. Every rule MUST have: a timeframe, an operator (above/below), and a target (a specific price OR a specific drawn line that exists in the list above). If ANY of these is missing or ambiguous, DO NOT fill it in with an assumption. Instead respond:
+{"ok":false,"needsClarification":true,"reason":"<one short sentence naming exactly what to add>"}
+Examples of when to refuse with needsClarification:
+- No timeframe given → reason: "Which timeframe? e.g. 4h, 1h, 15m."
+- Refers to "the line" but multiple lines exist or none match → reason: "Which line? Available: #1, #3. Name the number."
+- Refers to a line number that isn't in the available list → reason: "Line #5 isn't on your chart. Available: #1, #3."
+- No price and no line → reason: "What level — a price (e.g. 63000) or which drawn line?"
+- Direction unclear (doesn't say above/below or break up/down) → reason: "Close on a break above or below the level?"
+
+Only if the instruction is genuinely not an exit rule at all (gibberish, unrelated), respond {"ok":false,"reason":"Couldn't understand that as an exit rule — try rephrasing."}
+
+- label: short clear summary, e.g. "4h close below $63,000" or "4h failed retest of line 3 (break below, wick to line, close below)".`;
     try{
       const raw = await callClaude(prompt);
       const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
