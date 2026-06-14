@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.54';
+const SERVER_BUILD = '2026-06-14.55';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1540,20 +1540,20 @@ http.createServer(async (req, res)=>{
 - Gareth Soloway
 Also check Google Trends interest for "Bitcoin" as a gauge of general retail attention.
 
-Give a SEPARATE read for each person so the trader can weight them himself. Use EXACTLY this format with these markers:
+Give a SEPARATE read for each person. Output PLAIN TEXT ONLY — no markdown, no asterisks, no bold, no dashes as separators, no headings. Each section MUST start on its own new line with the marker in square brackets, exactly like the template. Do NOT echo the placeholder hints (do not write "1-2 sentences" or "<leaning>" literally) — replace them with the actual content.
 
-[OVERALL] <BULLISH / BEARISH / NEUTRAL / MIXED> — <confidence low/med/high>, one line on the spread of views
+Template (replace the angle-bracket parts with real content, keep the [MARKERS] literally):
+[OVERALL] LEANING then a short sentence on the spread of views
+[COWEN] LEANING then 1-2 sentences, paraphrased
+[MMCRYPTO] LEANING then 1-2 sentences
+[DAAX] LEANING then 1-2 sentences
+[SOLOWAY] LEANING then 1-2 sentences
+[COMMUNITY] one line on Google Trends / general attention
+[CONTRARIAN] one sentence flagging if views are lopsided
 
-[COWEN] <BULLISH/BEARISH/NEUTRAL/UNCERTAIN/NO RECENT READ> — 1-2 sentences, paraphrased, why
-[MMCRYPTO] <leaning> — 1-2 sentences
-[DAAX] <leaning> — 1-2 sentences
-[SOLOWAY] <leaning> — 1-2 sentences
-
-[COMMUNITY] <what Google Trends / general attention suggests — heating up, cooling, apathetic, euphoric>
-
-[CONTRARIAN] <one sentence — if views are lopsided, flag that extremes often precede reversals>
-
-Rules: paraphrase everything in your own words, never quote them directly. If you can't find recent info on someone, put "NO RECENT READ" for them rather than guessing. Keep each block tight.`;
+Where LEANING is one of: BULLISH, BEARISH, NEUTRAL, MIXED, UNCERTAIN, or NO RECENT READ.
+Put a blank line between each section. Start each line with its [MARKER] and nothing before it.
+Paraphrase in your own words, never quote them directly. If you can't find recent info on someone, write "[NAME] NO RECENT READ —" then say so briefly. Keep each section to 1-2 sentences — be concise.`;
     try{
       const text = await callClaudeWithSearch(prompt, 1600);
       sentimentCache = { text, at: Date.now() };
