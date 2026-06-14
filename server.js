@@ -1397,8 +1397,8 @@ http.createServer(async (req, res)=>{
     const n = bots.length;
     bots = [];
     botIdCounter = 0;            // reset numbering — truly fresh
-    blog(`All ${n} bot(s) DISARMED — clean slate, no snapshots retained`,'warn');
-    sendTelegram(`🛑 <b>All bots disarmed</b> — ${n} cleared, clean slate.`);
+    blog(`All ${n} TRIGGER bot(s) DISARMED — clean slate (pattern bot unaffected)`,'warn');
+    sendTelegram(`🛑 <b>All trigger bots disarmed</b> — ${n} cleared. Pattern bot is separate and still running.`);
     saveState();
     return json(res,200,{armed:false, totalBots: 0});
   }
