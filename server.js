@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.68';
+const SERVER_BUILD = '2026-06-14.70';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -40,6 +40,7 @@ function saveState(){
           lastDecisionCandle: aiBots.pattern.lastDecisionCandle,
         } : null,
         patternJournal,
+        researchLibrary, libraryEnabled,
         savedChartLines,
         sentimentCache,
       };
@@ -124,6 +125,37 @@ function journalForPrompt(){
   if(instr.length) out += `STANDING INSTRUCTIONS FROM THE TRADER (always follow these):\n${instr.map(e=>`• ${e.text}`).join('\n')}\n\n`;
   if(notes.length) out += `TRADER'S JOURNAL — observations & lessons to weigh before entering (most recent last):\n${notes.slice(-20).map(e=>`• ${e.text}`).join('\n')}`;
   return out.trim();
+}
+
+// ── RESEARCH LIBRARY ──
+// Curated companion conversations (your trade reasoning + the companion's
+// feedback). The pattern bot reads these to understand HOW YOU THINK, leaning
+// toward your style — but it can override if it strongly disagrees on risk.
+// Master switch (libraryEnabled) lets you turn this off from the AI page.
+let researchLibrary = [];        // [{id, t, plan, feedback, symbol, outcome, outcomePct}]
+let LIBRARY_FEED_N = 15;          // how many entries feed the bot's prompt
+let libraryEnabled = true;
+function rankLibrary(){
+  // Outcome-weighted selection of the most useful entries:
+  //  • WINNERS (reasoning that preceded a profitable trade) rank highest, best P&L first
+  //  • UNRATED entries (no trade outcome yet) come next, most recent first
+  //  • LOSERS rank lowest and age out (kept only if room remains)
+  // This keeps the reasoning that actually worked and lets failed reasoning fade.
+  const wins   = researchLibrary.filter(e=>e.outcome==='win').sort((a,b)=>(b.outcomePct||0)-(a.outcomePct||0));
+  const unrated= researchLibrary.filter(e=>!e.outcome).sort((a,b)=>b.t-a.t);
+  const losses = researchLibrary.filter(e=>e.outcome==='loss').sort((a,b)=>b.t-a.t);
+  return [...wins, ...unrated, ...losses];
+}
+function libraryForPrompt(){
+  if(!libraryEnabled || !researchLibrary.length) return '';
+  const recent = rankLibrary().slice(0, LIBRARY_FEED_N);
+  return `THE TRADER'S RESEARCH LIBRARY — their own trade reasoning, companion feedback, and strategy chats from past setups. Use this to understand HOW THIS TRADER THINKS and lean toward their documented style and preferences. Treat it as a STRONG STEER, not an absolute command: if a setup strongly violates sound risk management, you may override it, but say so explicitly and explain why. Entries tagged [bot chat] are past conversations with you — weigh the TRADER's words in them, not your own replies.\n` +
+    recent.map(e=>{
+      const tag = e.outcome ? ` [${e.outcome.toUpperCase()} ${e.outcomePct>=0?'+':''}${e.outcomePct}%]` : '';
+      const isChat = (e.plan||'').startsWith('[bot chat]');
+      if(isChat) return `— [${new Date(e.t).toISOString().slice(0,10)}]${tag} CHAT — trader said: ${e.plan.replace('[bot chat]','').trim()}`;
+      return `— [${new Date(e.t).toISOString().slice(0,10)}]${tag} PLAN: ${e.plan}${e.feedback?`\n   COMPANION NOTED: ${e.feedback.slice(0,300)}`:''}`;
+    }).join('\n');
 }
 
 // ── Public data cache (3s TTL) ──
@@ -749,6 +781,16 @@ async function exitTrade(bot, reason, price, completedTps){
   const res = await placeOrder(bot.config.symbol, closeSide, t.qty, t.leverage, 1, 0, 5);
   if(res.success) blog(`✅ Exit order placed. ID: ${res.data}`, 'ok');
   else blog(`Exit order error: ${JSON.stringify(res)}`, 'err');
+  // ── Tag the linked research-library entry with the real outcome ──
+  if(bot.config && bot.config.linkLibraryEntryId){
+    const entry = researchLibrary.find(e=>e.id===bot.config.linkLibraryEntryId);
+    if(entry){
+      entry.outcomePct = parseFloat(pct);
+      entry.outcomeAt = Date.now();
+      entry.outcome = pct>=0 ? 'win' : 'loss';
+      blog(`📚 Library entry tagged with outcome: ${pct>=0?'+':''}${pct}% (${entry.outcome})`, 'info');
+    }
+  }
   bot.activeTrade = null;
   retireBot(bot, `trade closed by ${reason}`);
 }
@@ -1280,7 +1322,7 @@ CURRENT PRICE: $${price}
 EQUITY: $${aiEquity(bot).toFixed(2)} ${bot.paper?'(PAPER MODE)':''}
 POSITION: ${bot.position?`${bot.position.side} @ $${bot.position.entryPrice}`:'none'}
 
-${journalForPrompt() ? journalForPrompt()+'\n\nBefore deciding, explicitly check the setup against your standing instructions and journal. If a standing instruction says not to trade here, HOLD. Reference the relevant journal lessons in your reasoning.\n' : ''}
+${journalForPrompt() ? journalForPrompt()+'\n\nBefore deciding, explicitly check the setup against your standing instructions and journal. If a standing instruction says not to trade here, HOLD. Reference the relevant journal lessons in your reasoning.\n' : ''}${libraryForPrompt() ? '\n'+libraryForPrompt()+'\n' : ''}
 ${reversals.length ? `🕯️ CANDLESTICK REVERSAL SIGNALS (confluence — weigh more when they align with an SFP sweep or a key level; higher timeframe = stronger):\n${reversals.map(r=>`${r.tf} ${r.pattern} (${r.dir})`).join('\n')}\nThese are supporting evidence for a reversal, NOT standalone triggers. A daily or weekly engulfing/star stacked with a swept level is high conviction; a lone 1h engulfing is weak.` : ''}
 
 ${htfSfps.length ? `🚨🚨 HIGH-TIMEFRAME SWING FAILURE — THE MOST IMPORTANT SIGNAL ON THIS CHART, DO NOT IGNORE:\n${htfSfps.map(s=>`${s.tf} ${s.type.toUpperCase()} SFP — price swept the ${s.tf.toLowerCase()} swing ${s.type==='bearish'?'high':'low'} at $${s.level.toFixed(0)} (reached $${s.wick.toFixed(0)}, ${s.penetrationPct}% beyond) and is back ${s.type==='bearish'?'below':'above'} it at $${s.close.toFixed(0)}.`).join('\n')}\nA daily/weekly SFP is a far higher-conviction reversal signal than any intraday pattern. Give it strong weight. Still apply risk management and confirm the close holds.` : ''}
@@ -1854,6 +1896,62 @@ For each analyst, ALSO note in their line how fresh the read is (e.g. "fresh 24h
   }
 
   // ── CHAT with the pattern bot ──
+  // ── TRADE COMPANION: honest feedback on a planned trade ──
+  if(url==='/companion/feedback' && req.method==='POST'){
+    if(!ANTHROPIC_KEY) return json(res,400,{error:'needs ANTHROPIC_API_KEY'});
+    const b = await readBody(req);
+    const plan = (b.plan||'').slice(0,1500);
+    const history = Array.isArray(b.history) ? b.history.slice(-10) : [];
+    if(!plan) return json(res,400,{error:'empty plan'});
+    let px = null; try{ px = await getTicker('BTC_USDT'); }catch(e){}
+    const convo = history.map(m=>`${m.role==='user'?'TRADER':'COMPANION'}: ${m.text}`).join('\n');
+    const prompt = `You are an experienced, HONEST trading companion for a futures trader. They will describe a trade they are planning. Your job is to be a genuine sparring partner — NOT a cheerleader.
+
+Rules for your feedback:
+- Be direct and honest. If the plan looks weak, say so plainly and explain why.
+- Name the specific risks: poor risk/reward, trading into a level, no clear invalidation, chasing, position too large, emotional tells in their wording.
+- Ask sharp questions: where's the stop, where's invalidation, what's the reward-to-risk, what would make you wrong?
+- Acknowledge what's GOOD about the plan too, when it's genuinely good — but never invent praise.
+- Do NOT just agree to be nice. A companion that validates everything is useless and harmful.
+- Keep it concise and conversational (a few sentences to a short paragraph). You're talking with them, not writing an essay.
+${px?`Current BTC price ≈ $${px}.`:''}
+${convo?`\nConversation so far:\n${convo}\n`:''}
+TRADER'S PLAN / MESSAGE: ${plan}
+
+Give your honest companion response:`;
+    try{
+      const text = await callClaude(prompt);
+      return json(res,200,{ feedback: text });
+    }catch(e){ return json(res,500,{error:e.message}); }
+  }
+
+  // ── RESEARCH LIBRARY endpoints ──
+  if(url==='/library/add' && req.method==='POST'){
+    const b = await readBody(req);
+    const entry = { id: Date.now()+''+Math.floor(Math.random()*1000), t: Date.now(),
+      plan: (b.plan||'').slice(0,1500), feedback: (b.feedback||'').slice(0,2000), symbol: b.symbol||'BTC_USDT' };
+    researchLibrary.push(entry);
+    if(researchLibrary.length>100) researchLibrary.shift();
+    saveState();
+    return json(res,200,{ok:true, entry, count:researchLibrary.length});
+  }
+  if(url.startsWith('/library/list')){
+    return json(res,200,{ entries: researchLibrary.slice(-50), enabled: libraryEnabled, count: researchLibrary.length });
+  }
+  if(url==='/library/delete' && req.method==='POST'){
+    const b = await readBody(req);
+    researchLibrary = researchLibrary.filter(e=>e.id!==b.id);
+    saveState();
+    return json(res,200,{ok:true, count:researchLibrary.length});
+  }
+  if(url==='/library/toggle' && req.method==='POST'){
+    const b = await readBody(req);
+    libraryEnabled = !!b.enabled;
+    blog(`📚 Research library ${libraryEnabled?'ENABLED':'DISABLED'} for the pattern bot`,'ok');
+    saveState();
+    return json(res,200,{ok:true, enabled:libraryEnabled});
+  }
+
   if(url==='/ai2/pattern/chat' && req.method==='POST'){
     if(!ANTHROPIC_KEY) return json(res,400,{error:'needs ANTHROPIC_API_KEY'});
     const b = await readBody(req);
@@ -2052,6 +2150,8 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
       if(Array.isArray(st.bots)) bots = st.bots;
       if(st.botIdCounter) botIdCounter = st.botIdCounter;
       if(st.patternJournal) patternJournal = st.patternJournal;
+      if(st.researchLibrary) researchLibrary = st.researchLibrary;
+      if(st.libraryEnabled != null) libraryEnabled = st.libraryEnabled;
       if(st.savedChartLines) savedChartLines = st.savedChartLines;
       if(st.sentimentCache) sentimentCache = st.sentimentCache;
       if(st.patternBot && aiBots.pattern) Object.assign(aiBots.pattern, st.patternBot);
