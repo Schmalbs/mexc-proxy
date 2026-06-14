@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.59';
+const SERVER_BUILD = '2026-06-14.60';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -670,6 +670,55 @@ setInterval(botTick, 8000); // bot heartbeat every 8s
 // AI TRADER — Claude makes every trading decision via the API
 // ─────────────────────────────────────────────────────────────
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+const YOUTUBE_KEY   = process.env.YOUTUBE_API_KEY || '';
+
+// Analyst YouTube channel handles → fetch their latest video via the Data API.
+const ANALYST_CHANNELS = [
+  { name:'Benjamin Cowen', handle:'@intothecryptoverse' },
+  { name:'MMCrypto',       handle:'@MMCryptoo' },
+  { name:'DAAN Crypto Trader', handle:'@DaanCrypto' },
+  { name:'Gareth Soloway', handle:'@GarethSoloway' },
+];
+
+// Fetch the latest video (title, description snippet, publish time) for each
+// analyst channel via the official YouTube Data API. Public data only.
+async function fetchLatestVideos(){
+  if(!YOUTUBE_KEY) return [];
+  const out = [];
+  for(const a of ANALYST_CHANNELS){
+    try{
+      // resolve handle → channel id → uploads playlist → latest item
+      const ch = await httpsGetJson(`https://www.googleapis.com/youtube/v3/channels?part=contentDetails&forHandle=${encodeURIComponent(a.handle)}&key=${YOUTUBE_KEY}`);
+      const uploads = ch && ch.items && ch.items[0] && ch.items[0].contentDetails.relatedPlaylists.uploads;
+      if(!uploads){ out.push({name:a.name, found:false}); continue; }
+      const pl = await httpsGetJson(`https://www.googleapis.com/youtube/v3/playlistItems?part=snippet&maxResults=1&playlistId=${uploads}&key=${YOUTUBE_KEY}`);
+      const item = pl && pl.items && pl.items[0] && pl.items[0].snippet;
+      if(!item){ out.push({name:a.name, found:false}); continue; }
+      const published = new Date(item.publishedAt);
+      const hoursAgo = (Date.now() - published.getTime()) / 3600000;
+      out.push({
+        name: a.name, found: true,
+        title: item.title,
+        desc: (item.description||'').slice(0, 400),
+        publishedAt: item.publishedAt,
+        hoursAgo: Math.round(hoursAgo),
+        fresh24h: hoursAgo <= 24,
+        videoId: item.resourceId && item.resourceId.videoId,
+      });
+    }catch(e){ out.push({name:a.name, found:false, error:e.message}); }
+  }
+  return out;
+}
+
+// Tiny JSON GET helper
+function httpsGetJson(url){
+  return new Promise((resolve,reject)=>{
+    https.get(url, res=>{
+      let d=''; res.on('data',c=>d+=c);
+      res.on('end',()=>{ try{ resolve(JSON.parse(d)); }catch(e){ reject(e); } });
+    }).on('error',reject);
+  });
+}
 
 
 
@@ -1550,7 +1599,17 @@ http.createServer(async (req, res)=>{
   }
   if(url==='/sentiment/refresh' && req.method==='POST'){
     if(!ANTHROPIC_KEY) return json(res,400,{error:'needs ANTHROPIC_API_KEY'});
-    const prompt = `Search the web for the most recent (last 1-2 weeks) Bitcoin/crypto outlook from each of these analysts INDIVIDUALLY, searching each by name separately so you get a distinct read on each one:
+    // Pull each analyst's LATEST video (title/description/recency) via YouTube Data API.
+    const vids = await fetchLatestVideos();
+    let vidContext = '';
+    if(vids.length){
+      vidContext = '\n\nLATEST YOUTUBE VIDEOS (from the official YouTube Data API — use these as the most current, datable signal of each analyst\'s stance; the title and description tell you their newest framing):\n'
+        + vids.map(v=> v.found
+            ? `- ${v.name}: "${v.title}" (posted ${v.hoursAgo}h ago${v.fresh24h?' — FRESH, within 24h':''}). Description: ${v.desc}`
+            : `- ${v.name}: no latest video retrieved`).join('\n')
+        + '\n\nPRIORITISE content from the last 24 hours. If an analyst\'s newest video is within 24h, weight it heavily and note it as a fresh read. If their most recent datable view is older, say how old it is rather than presenting it as current.';
+    }
+    const prompt = `Search the web for the most recent Bitcoin/crypto outlook from each of these analysts INDIVIDUALLY, searching each by name separately so you get a distinct read on each one:
 - Benjamin Cowen (Into The Cryptoverse)
 - MMCrypto
 - DAAN Crypto Trader (daax)
@@ -1570,9 +1629,11 @@ Template (replace the angle-bracket parts with real content, keep the [MARKERS] 
 
 Where LEANING is one of: BULLISH, BEARISH, NEUTRAL, MIXED, UNCERTAIN, or NO RECENT READ.
 Put a blank line between each section. Start each line with its [MARKER] and nothing before it.
-Paraphrase in your own words, never quote them directly. If you can't find recent info on someone, write "[NAME] NO RECENT READ —" then say so briefly. Keep each section to 1-2 sentences — be concise.`;
+Paraphrase in your own words, never quote them directly. If you can't find recent info on someone, write "[NAME] NO RECENT READ —" then say so briefly. Keep each section to 1-2 sentences — be concise.
+
+For each analyst, ALSO note in their line how fresh the read is (e.g. "fresh 24h video" or "last datable view 5 days ago").` + vidContext;
     try{
-      const text = await callClaudeWithSearch(prompt, 1600);
+      const text = await callClaudeWithSearch(prompt, 1800);
       sentimentCache = { text, at: Date.now() };
       saveState();
       return json(res,200,{ text, at: sentimentCache.at });
