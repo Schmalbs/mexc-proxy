@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.65';
+const SERVER_BUILD = '2026-06-14.66';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1576,10 +1576,27 @@ Only if the instruction is genuinely not an exit rule at all (gibberish, unrelat
     const b = await readBody(req);
     const bot = bots.find(x=>x.id===b.botId);
     if(!bot || !bot.activeTrade) return json(res,400,{error:'no active trade for that bot'});
-    bot.activeTrade.customExits = Array.isArray(b.rules) ? b.rules.slice(0,5) : [];
-    blog(`📜 Bot #${bot.id} custom exit rules updated (${bot.activeTrade.customExits.length})`,'ok');
+    const t = bot.activeTrade;
+    const incoming = Array.isArray(b.rules) ? b.rules : [];
+    // append mode (default) adds to existing rules; replace clears first
+    if(b.replace) { t.customExits = []; t._retestStage = {}; t._customExitCandle = {}; }
+    t.customExits = t.customExits || [];
+    t._retestStage = t._retestStage || {};
+    for(const rule of incoming){
+      if(t.customExits.length >= 5) break;
+      t.customExits.push(rule);
+      const ri = t.customExits.length - 1;
+      const ruleKey = (rule.kind||'simple') + ':' + ri + ':' + rule.tf + ':' + (rule.lineId!=null?('L'+rule.lineId):rule.level);
+      // For a failed-retest rule attached mid-trade: if the trader said the break
+      // is already confirmed (price already past the line), pre-seed stage 2.
+      if(rule.kind==='failed_retest' && rule.breakAlreadyConfirmed){
+        t._retestStage[ruleKey] = true;
+        blog(`📜 Bot #${bot.id} failed-retest rule attached with break PRE-CONFIRMED — watching for rejection now.`,'info');
+      }
+    }
+    blog(`📜 Bot #${bot.id} custom exit rules updated (${t.customExits.length} total)`,'ok');
     saveState();
-    return json(res,200,{ok:true, customExits:bot.activeTrade.customExits});
+    return json(res,200,{ok:true, customExits:t.customExits});
   }
 
   // ── TICKER — cached 1.5s, shared across all browser tabs + bots ──
