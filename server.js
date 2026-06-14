@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.60';
+const SERVER_BUILD = '2026-06-14.61';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -674,11 +674,13 @@ const YOUTUBE_KEY   = process.env.YOUTUBE_API_KEY || '';
 
 // Analyst YouTube channel handles → fetch their latest video via the Data API.
 const ANALYST_CHANNELS = [
-  { name:'Benjamin Cowen', handle:'@intothecryptoverse' },
-  { name:'MMCrypto',       handle:'@MMCryptoo' },
-  { name:'DAAN Crypto Trader', handle:'@DaanCrypto' },
-  { name:'Gareth Soloway', handle:'@GarethSoloway' },
+  { name:'Benjamin Cowen', handle:'@benjaminjcowen' },
+  { name:'MMCrypto',       handle:'@MMCryptoTube' },
+  { name:'Gareth Soloway', handle:'@GarethSolowayProTrader' },
+  { name:'Jason Pizzino',  handle:'@JasonPizzinoOfficial' },
 ];
+// Kyle Stagoll (aka Trader Daxx) features mostly as a guest on other channels,
+// so the latest-video API won't capture him — he's covered via web search.
 
 // Fetch the latest video (title, description snippet, publish time) for each
 // analyst channel via the official YouTube Data API. Public data only.
@@ -1612,8 +1614,9 @@ http.createServer(async (req, res)=>{
     const prompt = `Search the web for the most recent Bitcoin/crypto outlook from each of these analysts INDIVIDUALLY, searching each by name separately so you get a distinct read on each one:
 - Benjamin Cowen (Into The Cryptoverse)
 - MMCrypto
-- DAAN Crypto Trader (daax)
 - Gareth Soloway
+- Jason Pizzino
+- Kyle Stagoll (also known as "Trader Daxx", founder of Market Mastery — search both names; he often appears as a guest on other channels and posts on X/Substack, so look there too)
 Also check Google Trends interest for "Bitcoin" as a gauge of general retail attention.
 
 Give a SEPARATE read for each person. Output PLAIN TEXT ONLY — no markdown, no asterisks, no bold, no dashes as separators, no headings. Each section MUST start on its own new line with the marker in square brackets, exactly like the template. Do NOT echo the placeholder hints (do not write "1-2 sentences" or "<leaning>" literally) — replace them with the actual content.
@@ -1622,8 +1625,9 @@ Template (replace the angle-bracket parts with real content, keep the [MARKERS] 
 [OVERALL] LEANING then a short sentence on the spread of views
 [COWEN] LEANING then 1-2 sentences, paraphrased
 [MMCRYPTO] LEANING then 1-2 sentences
-[DAAX] LEANING then 1-2 sentences
 [SOLOWAY] LEANING then 1-2 sentences
+[PIZZINO] LEANING then 1-2 sentences
+[STAGOLL] LEANING then 1-2 sentences (Kyle Stagoll / Trader Daxx)
 [COMMUNITY] one line on Google Trends / general attention
 [CONTRARIAN] one sentence flagging if views are lopsided
 
