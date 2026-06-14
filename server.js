@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.58';
+const SERVER_BUILD = '2026-06-14.59';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1666,9 +1666,12 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
 
   if(url==='/ai2/pattern/status'){
     const bot = aiBots.pattern;
+    let curPrice = null;
+    if(bot.position){ try{ curPrice = await getTicker(bot.symbol); }catch(e){} }
     return json(res,200,{
       enabled: bot.enabled, paper: bot.paper, hasApiKey: !!ANTHROPIC_KEY,
       allocation: bot.allocation, realizedPnl: bot.realizedPnl,
+      currentPrice: curPrice, contractSize: contractSize(bot.symbol), symbol: bot.symbol,
       position: bot.position, decisions: bot.decisions.slice(-12),
       tradeHistory: bot.tradeHistory.slice(-200), decisionTf: bot.decisionTf,
       equityCurve: (()=>{ let eq=bot.allocation||100; const out=[{t:null, eq}];
