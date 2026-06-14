@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.66';
+const SERVER_BUILD = '2026-06-14.68';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -202,6 +202,23 @@ function blog(msg, type=''){
   console.log(`[BOT] ${msg}`);
 }
 
+// Expand a rule that names multiple timeframes (tfs:[...]) into one rule per
+// timeframe, so the proven single-tf enforcement handles each independently.
+// A single-tf rule passes through unchanged.
+function expandExitRules(rules){
+  const out = [];
+  for(const r of (rules||[])){
+    if(Array.isArray(r.tfs) && r.tfs.length){
+      for(const tf of r.tfs){
+        out.push(Object.assign({}, r, { tf, tfs: undefined, _group: r.label || ('multi-'+r.operator+'-'+(r.level||r.lineId)) }));
+      }
+    } else {
+      out.push(r);
+    }
+  }
+  return out;
+}
+
 function priceOnLine(line, t){
   if(line.isHoriz) return line.horizPrice;
   const slope = (line.p2.price - line.p1.price) / (line.p2.time - line.p1.time);
@@ -385,6 +402,15 @@ async function runBot(bot){
             blog(`📜 Bot #${bot.id} CUSTOM EXIT: ${rule.tf} close ${rule.operator} ${lvl.toFixed(2)} (${c.close}) — closing`, 'warn');
             sendTelegram(`📜 <b>Bot #${bot.id} custom exit</b>\n"${rule.label||(rule.tf+' close '+rule.operator+' '+lvl.toFixed(2))}"\nClosed at $${c.close}.`);
             return exitTrade(bot, 'custom rule', c.close, t.activeTpCount||0);
+          }
+          // ONE-SHOT: if this rule only watches the NEXT candle, and that candle
+          // just closed without triggering, retire the rule (it won't fire later).
+          if(rule.onceOnly){
+            t.customExits.splice(ri, 1);
+            blog(`📜 Bot #${bot.id} one-shot exit rule expired — the next ${rule.tf} candle closed at ${c.close} without breaching ${lvl.toFixed(2)}. Rule removed.`, 'info');
+            sendTelegram(`📜 <b>Bot #${bot.id} one-shot rule expired</b>\nThe next ${rule.tf} candle didn't close ${rule.operator} ${lvl.toFixed(2)} — rule removed, trade continues.`);
+            saveState();
+            ri--; // array shifted; adjust index
           }
           continue;
         }
@@ -680,7 +706,7 @@ async function runBot(bot){
       activeTpCount: 0,
       tp: { mode: cfg.tp.mode, tf: cfg.tp.tf },
       sl: { mode: cfg.sl.mode, tf: cfg.sl.tf },
-      customExits: Array.isArray(cfg.customExits) ? cfg.customExits.slice(0,5) : [],
+      customExits: expandExitRules(Array.isArray(cfg.customExits) ? cfg.customExits : []).slice(0,8),
       mexcSlOrderId,
       openedAt: Date.now(),
     };
@@ -1540,9 +1566,12 @@ Trader said: "${text}"
 ${lineList}
 
 Respond ONLY with JSON, no markdown. For a SIMPLE rule:
-{"ok":true,"kind":"simple","tf":"...","operator":"below|above","level":<number|null>,"lineId":<number|null>,"label":"..."}
+{"ok":true,"kind":"simple","tf":"..." OR "tfs":["...","..."],"operator":"below|above","level":<number|null>,"lineId":<number|null>,"onceOnly":<true|false>,"label":"..."}
+Set "onceOnly":true ONLY when the trader specifies a SINGLE upcoming candle — phrases like "the next candle", "the next 1h candle", "if the next candle closes...". This means: check only the very next candle on that timeframe; if it does not trigger, the rule is cancelled. For any ongoing condition ("if a 4h closes below", "whenever", "as soon as"), set "onceOnly":false.
+
+MULTIPLE TIMEFRAMES: if the trader lists several timeframes (e.g. "1h, 4h, daily and weekly" or "on any of 1h/4h/1D/1W"), return a "tfs" ARRAY of the exact tf strings instead of a single "tf". Example: "tfs":["Min60","Hour4","Day1","Week1"]. The rule then fires if a candle on ANY of those timeframes closes past the level. Weekly = Week1. When only one timeframe is named, use "tf" as normal (no tfs array).
 For a FAILED RETEST rule:
-{"ok":true,"kind":"failed_retest","tf":"...","operator":"below|above","level":<number|null>,"lineId":<number|null>,"retestPct":<number, default 0.1>,"label":"..."}
+{"ok":true,"kind":"failed_retest","tf":"..." OR "tfs":["...","..."],"operator":"below|above","level":<number|null>,"lineId":<number|null>,"retestPct":<number, default 0.1>,"label":"..."}
 
 Rules:
 - tf exact strings: 4h=Hour4, 1h=Min60, 15m=Min15, 5m=Min5, 30m=Min30, daily=Day1.
@@ -1561,7 +1590,7 @@ Examples of when to refuse with needsClarification:
 
 Only if the instruction is genuinely not an exit rule at all (gibberish, unrelated), respond {"ok":false,"reason":"Couldn't understand that as an exit rule — try rephrasing."}
 
-- label: short clear summary, e.g. "4h close below $63,000" or "4h failed retest of line 3 (break below, wick to line, close below)".`;
+- label: short clear summary. If onceOnly, say so, e.g. "NEXT 1h candle close below $63,000 (one-shot)". Otherwise "4h close below $63,000" or "4h failed retest of line 3".`;
     try{
       const raw = await callClaude(prompt);
       const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
@@ -1577,7 +1606,7 @@ Only if the instruction is genuinely not an exit rule at all (gibberish, unrelat
     const bot = bots.find(x=>x.id===b.botId);
     if(!bot || !bot.activeTrade) return json(res,400,{error:'no active trade for that bot'});
     const t = bot.activeTrade;
-    const incoming = Array.isArray(b.rules) ? b.rules : [];
+    const incoming = expandExitRules(Array.isArray(b.rules) ? b.rules : []);
     // append mode (default) adds to existing rules; replace clears first
     if(b.replace) { t.customExits = []; t._retestStage = {}; t._customExitCandle = {}; }
     t.customExits = t.customExits || [];
