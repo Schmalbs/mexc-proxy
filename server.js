@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.62';
+const SERVER_BUILD = '2026-06-14.63';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -352,6 +352,34 @@ async function runBot(bot){
     const price = t.tp.mode==='price' || t.sl.mode==='price'
       ? await getTicker(cfg.symbol) : null;
 
+    // ── CUSTOM EXIT RULES (plain-English rules, deterministically enforced) ──
+    // Each rule: {tf, operator:'below'|'above', level OR lineId, label}
+    // Triggers a FULL close when a candle on that TF closes past the level.
+    if(Array.isArray(t.customExits) && t.customExits.length){
+      t._customExitCandle = t._customExitCandle || {};
+      for(const rule of t.customExits){
+        const c = await getLastClosedCandle(cfg.symbol, rule.tf);
+        if(!c) continue;
+        // only evaluate once per new candle on that timeframe
+        const seenKey = rule.tf + ':' + (rule.lineId!=null?('L'+rule.lineId):rule.level);
+        if(t._customExitCandle[seenKey] === c.time) continue;
+        t._customExitCandle[seenKey] = c.time;
+        // resolve the level: explicit price, or a line value at this candle time
+        let lvl = rule.level;
+        if(rule.lineId != null){
+          const ln = (cfg.lines||[]).find(L=>String(L.id)===String(rule.lineId));
+          if(ln) lvl = priceOnLine(ln, c.time);
+        }
+        if(lvl == null) continue;
+        const hit = rule.operator==='below' ? c.close < lvl : c.close > lvl;
+        if(hit){
+          blog(`📜 Bot #${bot.id} CUSTOM EXIT: ${rule.tf} close ${rule.operator} ${lvl.toFixed(2)} (${c.close}) — closing trade`, 'warn');
+          sendTelegram(`📜 <b>Bot #${bot.id} custom exit triggered</b>\n"${rule.label||(rule.tf+' close '+rule.operator+' '+lvl.toFixed(2))}"\nCandle closed at $${c.close} — closing position.`);
+          return exitTrade(bot, 'custom rule', c.close, t.activeTpCount||0);
+        }
+      }
+    }
+
     // ── STOP LOSS ──
     if(price != null && t.sl.mode==='price'){
       const slHit = t.side==='BUY' ? price <= t.slPrice : price >= t.slPrice;
@@ -618,6 +646,7 @@ async function runBot(bot){
       activeTpCount: 0,
       tp: { mode: cfg.tp.mode, tf: cfg.tp.tf },
       sl: { mode: cfg.sl.mode, tf: cfg.sl.tf },
+      customExits: Array.isArray(cfg.customExits) ? cfg.customExits.slice(0,5) : [],
       mexcSlOrderId,
       openedAt: Date.now(),
     };
@@ -1456,6 +1485,50 @@ http.createServer(async (req, res)=>{
     sendTelegram(`🛑 <b>All trigger bots disarmed</b> — ${n} cleared. Pattern bot is separate and still running.`);
     saveState();
     return json(res,200,{armed:false, totalBots: 0});
+  }
+
+  // ── CUSTOM EXIT RULE PARSER (AI translates English → structured rule) ──
+  if(url==='/bot/parse-exit' && req.method==='POST'){
+    if(!ANTHROPIC_KEY) return json(res,400,{error:'needs ANTHROPIC_API_KEY'});
+    const b = await readBody(req);
+    const text = (b.text||'').slice(0,300);
+    const lines = b.lines || []; // [{id, isHoriz, horizPrice, p1, p2}]
+    if(!text) return json(res,400,{error:'empty'});
+    const lineList = lines.length
+      ? 'Available drawn lines (use lineId if the user refers to a line): ' + lines.map(l=>`#${l.id}${l.isHoriz?` (horizontal @ ${l.horizPrice})`:' (trend line)'}`).join(', ')
+      : 'No drawn lines available.';
+    const prompt = `Translate this trader's plain-English EXIT instruction into a strict JSON rule. The rule closes an open trade when a candle closes past a level.
+
+Trader said: "${text}"
+${lineList}
+
+Respond ONLY with JSON, no markdown:
+{"ok":true,"tf":"Min5|Min15|Min30|Min60|Hour4|Day1","operator":"below|above","level":<number or null>,"lineId":<number or null>,"label":"<short human summary>"}
+Rules:
+- tf must be one of the exact strings listed (4h=Hour4, 1h=Min60, 15m=Min15, 5m=Min5, 30m=Min30, daily=Day1).
+- If the trader names a price, put it in "level" and set lineId null.
+- If the trader refers to a line, set "lineId" to that line's number and level null.
+- operator "below" = close below the level, "above" = close above.
+- If you cannot confidently parse it, respond {"ok":false,"reason":"<why>"}.
+- label: a short clear summary like "4h close below $63,000".`;
+    try{
+      const raw = await callClaude(prompt);
+      const parsed = JSON.parse(raw.replace(/```json|```/g,'').trim());
+      return json(res,200, parsed);
+    }catch(e){
+      return json(res,500,{ok:false, reason:'parse failed: '+e.message});
+    }
+  }
+
+  // ── Attach/replace custom exit rules on a LIVE trade ──
+  if(url==='/bot/set-exits' && req.method==='POST'){
+    const b = await readBody(req);
+    const bot = bots.find(x=>x.id===b.botId);
+    if(!bot || !bot.activeTrade) return json(res,400,{error:'no active trade for that bot'});
+    bot.activeTrade.customExits = Array.isArray(b.rules) ? b.rules.slice(0,5) : [];
+    blog(`📜 Bot #${bot.id} custom exit rules updated (${bot.activeTrade.customExits.length})`,'ok');
+    saveState();
+    return json(res,200,{ok:true, customExits:bot.activeTrade.customExits});
   }
 
   // ── TICKER — cached 1.5s, shared across all browser tabs + bots ──
