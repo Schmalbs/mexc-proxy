@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.80';
+const SERVER_BUILD = '2026-06-14.81';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -29,7 +29,7 @@ function saveState(){
     try{
       const state = {
         v: 1, savedAt: Date.now(),
-        bots, botIdCounter,
+        bots, botIdCounter, triggerBotsPaused,
         patternBot: aiBots && aiBots.pattern ? {
           enabled: aiBots.pattern.enabled, paper: aiBots.pattern.paper,
           allocation: aiBots.pattern.allocation, startEquity: aiBots.pattern.startEquity,
@@ -225,6 +225,7 @@ function mexcPublic(path){
 // ─────────────────────────────────────────────────────────────
 let bots         = [];   // [{id, config, activeTrade, lastCandleTime, lastTpCandle, lastSlCandle, syncCounter}]
 let botIdCounter = 0;
+let triggerBotsPaused = false; // global pause: trigger bots stop making NEW entries (open trades still managed unless individually unmanaged)
 let botLogs      = [];    // recent log lines for client display
 
 function blog(msg, type=''){
@@ -491,6 +492,12 @@ async function runBot(bot){
 
   // ── Manage open trade exits ──
   if(bot.activeTrade){
+    // Per-trade pause: if the trader took manual control of this trade, the bot
+    // stops managing its exits (SL/TP/rules). The position stays open; the trader
+    // is responsible for closing it (any real exchange-side stop still applies).
+    if(bot.activeTrade.unmanaged){
+      return; // hands-off — do not touch exits on this trade
+    }
     const t = bot.activeTrade;
     const price = t.tp.mode==='price' || t.sl.mode==='price'
       ? await getTicker(cfg.symbol) : null;
@@ -670,6 +677,7 @@ async function runBot(bot){
   }
 
   // ── Look for entry trigger ──
+  if(triggerBotsPaused) return; // global pause: trigger bots make no NEW entries
   if(bot.fired) return; // one-shot: this bot already opened its trade
   const candle = await getLastClosedCandle(cfg.symbol, cfg.trigTf);
   if(!candle || candle.time === bot.lastCandleTime) return;
@@ -1837,6 +1845,27 @@ Only if the instruction is genuinely not an exit rule at all (gibberish, unrelat
   }
 
   // ── Attach/replace custom exit rules on a LIVE trade ──
+  if(url==='/bot/pause-triggers' && req.method==='POST'){
+    const b = await readBody(req);
+    triggerBotsPaused = !!b.paused;
+    blog(`⏸️ Trigger bots ${triggerBotsPaused?'PAUSED — no new entries (open trades still managed)':'RESUMED — entries active'}`, 'ok');
+    saveState();
+    return json(res,200,{ok:true, paused:triggerBotsPaused});
+  }
+  if(url==='/bot/set-managed' && req.method==='POST'){
+    const b = await readBody(req);
+    const bot = bots.find(x=>x.id===b.botId);
+    if(!bot || !bot.activeTrade) return json(res,400,{error:'no active trade for that bot'});
+    bot.activeTrade.unmanaged = !b.managed; // managed:false → unmanaged:true
+    if(bot.activeTrade.unmanaged){
+      blog(`⚠️ Bot #${bot.id} trade set to UNMANAGED — the bot will NOT enforce its SL/TP. You control exits.${bot.activeTrade.mexcSlOrderId?' (A real stop order still sits on MEXC.)':' (No exchange-side stop — fully manual.)'}`, 'warn');
+    } else {
+      blog(`✅ Bot #${bot.id} trade back under bot management — SL/TP enforced again.`, 'ok');
+    }
+    saveState();
+    return json(res,200,{ok:true, unmanaged: bot.activeTrade.unmanaged, hasExchangeStop: !!bot.activeTrade.mexcSlOrderId});
+  }
+
   if(url==='/bot/modify-trade' && req.method==='POST'){
     const b = await readBody(req);
     const bot = bots.find(x=>x.id===b.botId);
@@ -2305,6 +2334,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
   if(url==='/bot/status'){
     return json(res,200,{
       armed: bots.length > 0,
+      triggerBotsPaused,
       bots: bots.map(b => ({
         id: b.id,
         symbol: b.config.symbol,
@@ -2449,6 +2479,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
     try{
       if(Array.isArray(st.bots)) bots = st.bots;
       if(st.botIdCounter) botIdCounter = st.botIdCounter;
+      if(typeof st.triggerBotsPaused === 'boolean') triggerBotsPaused = st.triggerBotsPaused;
       if(st.patternJournal) patternJournal = st.patternJournal;
       if(st.researchLibrary) researchLibrary = st.researchLibrary;
       if(st.libraryEnabled != null) libraryEnabled = st.libraryEnabled;
