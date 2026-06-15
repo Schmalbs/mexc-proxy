@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.79';
+const SERVER_BUILD = '2026-06-14.80';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1873,8 +1873,21 @@ Only if the instruction is genuinely not an exit rule at all (gibberish, unrelat
       if(t.tpLevels && t.tpLevels.length){ t.tpLevels[0].type='price'; t.tpLevels[0].price=newTp; }
       changes.push(`TP → $${newTp}`);
     }
-    // Modify the close-percentage at each TP level
-    if(Array.isArray(b.levelSizes) && t.tpLevels){
+    // Replace the full TP-level set (prices/types/sizes) if provided
+    if(Array.isArray(b.tpLevels) && b.tpLevels.length){
+      t.tpLevels = b.tpLevels.map(l=>({
+        type: l.type==='pct' ? 'pct' : 'price',
+        price: l.price!=null ? parseFloat(l.price) : null,
+        pct: l.pct!=null ? parseFloat(l.pct) : 2,
+        size: l.size!=null ? parseFloat(l.size) : 100,
+      }));
+      t.tpLine = null; // manual levels override any moving-line TP
+      // keep activeTpCount valid if levels shrank
+      if(t.activeTpCount && t.activeTpCount > t.tpLevels.length) t.activeTpCount = 0;
+      changes.push(`TP levels → ${t.tpLevels.map(l=>(l.type==='price'?'$'+l.price:l.pct+'%')+'@'+l.size+'%').join(', ')}`);
+    }
+    // Modify just the close-percentage at each TP level (legacy path)
+    else if(Array.isArray(b.levelSizes) && t.tpLevels){
       b.levelSizes.forEach((sz,i)=>{ if(t.tpLevels[i] && sz!=null && !isNaN(parseFloat(sz))) t.tpLevels[i].size = parseFloat(sz); });
       changes.push(`TP sizes → ${t.tpLevels.map(l=>l.size+'%').join('/')}`);
     }
