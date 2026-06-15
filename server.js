@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.76';
+const SERVER_BUILD = '2026-06-14.77';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -567,6 +567,12 @@ async function runBot(bot){
     }
 
     // ── STOP LOSS ──
+    // If an SL line is attached, recompute its price each tick. A horizontal line
+    // returns a fixed price; a sloped line returns its CURRENT price (moving stop).
+    if(t.slLine){
+      const lp = priceOnLine(t.slLine, Math.floor(Date.now()/1000));
+      if(lp != null && !isNaN(lp)) t.slPrice = lp;
+    }
     if(price != null && t.sl.mode==='price'){
       const slHit = t.side==='BUY' ? price <= t.slPrice : price >= t.slPrice;
       if(slHit) return exitTrade(bot, 'SL', price, t.activeTpCount||0);
@@ -581,6 +587,12 @@ async function runBot(bot){
     }
 
     // ── MULTI-TP LEVELS ──
+    // If a TP line is attached, recompute its current price (moving target for
+    // sloped lines; fixed for horizontal) and apply it to the first TP level.
+    if(t.tpLine && t.tpLevels && t.tpLevels.length){
+      const lp = priceOnLine(t.tpLine, Math.floor(Date.now()/1000));
+      if(lp != null && !isNaN(lp)){ t.tpLevels[0].type = 'price'; t.tpLevels[0].price = lp; }
+    }
     const tpLevels = t.tpLevels || [{pct: t.tpPct||2, size:100}];
     const checkPrice = t.tp.mode==='price' ? price : null;
     const checkCandle = t.tp.mode==='candle'
@@ -806,15 +818,23 @@ async function runBot(bot){
   sendTelegram(`🔔 <b>Bot #${bot.id} trigger fired!</b>\n${cfg.symbol} candle closed ${dir} ${triggerLabel}\nClose: $${candle.close}`);
 
   const entry = candle.close;
-  const tpPrice = cfg.tp.type==='price' ? parseFloat(cfg.tp.value)
-    : (side==='BUY' ? entry*(1+cfg.tp.value/100) : entry*(1-cfg.tp.value/100));
-  // SL price: exact price | % price move | % of margin (converted via leverage)
+  // SL/TP can be designated as a drawn LINE (cfg.sl.lineId / cfg.tp.lineId).
+  // Horizontal line = fixed price; sloped line = moving stop/target (recomputed each tick).
+  const findLine = (id) => (cfg.lines||[]).find(l => String(l.id)===String(id));
+  const slLineObj = (cfg.sl && cfg.sl.lineId != null) ? findLine(cfg.sl.lineId) : null;
+  const tpLineObj = (cfg.tp && cfg.tp.lineId != null) ? findLine(cfg.tp.lineId) : null;
+
+  const tpPrice = tpLineObj ? priceOnLine(tpLineObj, candle.time)
+    : (cfg.tp.type==='price' ? parseFloat(cfg.tp.value)
+    : (side==='BUY' ? entry*(1+cfg.tp.value/100) : entry*(1-cfg.tp.value/100)));
+  // SL price: line | exact price | % price move | % of margin (converted via leverage)
   let slMovePct = cfg.sl.value;
   if(cfg.sl.type==='margin'){
     slMovePct = cfg.sl.value / (cfg.leverage||1); // 50% margin at 10x = 5% price move
   }
-  const slPrice = cfg.sl.type==='price' ? parseFloat(cfg.sl.value)
-    : (side==='BUY' ? entry*(1-slMovePct/100) : entry*(1+slMovePct/100));
+  const slPrice = slLineObj ? priceOnLine(slLineObj, candle.time)
+    : (cfg.sl.type==='price' ? parseFloat(cfg.sl.value)
+    : (side==='BUY' ? entry*(1-slMovePct/100) : entry*(1+slMovePct/100)));
 
   if(cfg.leverage > 1){
     await mexcRequest('POST','/api/v1/private/position/change_leverage',{
@@ -846,12 +866,17 @@ async function runBot(bot){
         blog(`⚠️ Real SL order failed — server-managed SL fallback: ${JSON.stringify(slRes).slice(0,150)}`, 'warn');
       }
     }catch(e){ blog(`SL order error: ${e.message}`, 'warn'); }
+    if(slLineObj && !slLineObj.isHoriz){
+      blog(`📈 Bot #${bot.id} SL is a SLOPED line — server moves the stop along the line each tick. The MEXC stop order (@ $${slPrice.toFixed(2)}) is a static safety floor only; the server-managed moving stop is primary.`, 'ok');
+    }
 
     sendTelegram(`✅ <b>Bot #${bot.id}: ${side} order placed</b>\n${cfg.symbol} @ $${entry}\nQty: ${orderQty} | ${cfg.leverage}×\nTP: $${tpPrice.toFixed(4)} | SL: $${slPrice.toFixed(4)}${mexcSlOrderId?' (real SL on exchange ✓)':' (server-managed SL fallback)'}`);
     bot.activeTrade = {
       side, entryPrice: entry,
       tpPrice,
       slPrice,
+      slLine: slLineObj ? {id:slLineObj.id, p1:slLineObj.p1, p2:slLineObj.p2, isHoriz:!!slLineObj.isHoriz, horizPrice:slLineObj.horizPrice} : null,
+      tpLine: tpLineObj ? {id:tpLineObj.id, p1:tpLineObj.p1, p2:tpLineObj.p2, isHoriz:!!tpLineObj.isHoriz, horizPrice:tpLineObj.horizPrice} : null,
       qty: orderQty,
       leverage: cfg.leverage,
       tpPct: cfg.tp.value,
