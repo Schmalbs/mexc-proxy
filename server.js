@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.75';
+const SERVER_BUILD = '2026-06-14.76';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -1392,12 +1392,54 @@ async function patternTick(){
     const wHigh = kd&&kd.success ? Math.max(...kd.data.high.slice(0,7).map(Number)) : null;
     const wLow  = kd&&kd.success ? Math.min(...kd.data.low.slice(0,7).map(Number)) : null;
 
-    // user lines from savedChartLines if requested
+    // ── USER'S DRAWN LINES — AUTHORITATIVE S/R, ranked by colour/timeframe strength ──
+    // Colour encodes the timeframe the line was drawn on = its strength.
+    // Weekly(purple) strongest → Daily(green) → 4h(blue) → 1h(yellow) → ≤15m(white) weakest.
+    // These SUPERSEDE the bot's own pivot-derived S/R per the trader's rule.
+    const lineStrength = (l) => {
+      const byTf = { '1w':5, '1d':4, '4h':3, '1h':2, '15m':1, '5m':1, '1m':1 };
+      if(l.tf && byTf[l.tf]) return byTf[l.tf];
+      // fall back to colour if tf missing (older lines)
+      const c = (l.color||'').toLowerCase();
+      if(c.includes('a855f7')||c==='purple') return 5;
+      if(c.includes('00c896')||c==='green')  return 4;
+      if(c.includes('3d7fff')||c==='blue')   return 3;
+      if(c.includes('f5d020')||c.includes('f5a623')||c==='yellow') return 2;
+      return 1; // white / unknown
+    };
+    const strengthLabel = ['', 'weak (≤15m)', '1h', '4h (strong)', 'daily (very strong)', 'weekly (strongest)'];
+    const tfLabel = { '1w':'weekly','1d':'daily','4h':'4h','1h':'1h','15m':'15m','5m':'5m','1m':'1m' };
     let userLines = [];
-    if(bot.lineSource!=='ai' && savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines){
-      userLines = savedChartLines[bot.symbol].lines.map(l=>
-        l.isHoriz ? `USER horizontal @ $${l.horizPrice.toFixed(0)}`
-                  : `USER trendline (${new Date(l.p1.time*1000).toISOString().slice(5,16)} $${l.p1.price.toFixed(0)}) → (${new Date(l.p2.time*1000).toISOString().slice(5,16)} $${l.p2.price.toFixed(0)})`);
+    let userLineLevels = []; // {price, strength, desc}
+    const haveUserLines = savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines && savedChartLines[bot.symbol].lines.length;
+    // useAiLines: true when lineSource allows the AI to fill obvious gaps ('both'); false = user lines only
+    bot.useAiLines = (bot.lineSource === 'both' || bot.lineSource === 'ai');
+    if(haveUserLines){
+      for(const l of savedChartLines[bot.symbol].lines){
+        const st = lineStrength(l);
+        const tfL = l.tf ? tfLabel[l.tf]||l.tf : 'unknown-tf';
+        if(l.isHoriz){
+          userLines.push(`YOUR ${tfL} line @ $${l.horizPrice.toFixed(0)} — strength: ${strengthLabel[st]}`);
+          userLineLevels.push({price:l.horizPrice, strength:st, desc:`your ${tfL} level`});
+        } else {
+          const nowP = priceOnLine(l, Math.floor(Date.now()/1000));
+          userLines.push(`YOUR ${tfL} trendline (now ≈ $${(nowP||l.p2.price).toFixed(0)}) — strength: ${strengthLabel[st]}`);
+          if(nowP) userLineLevels.push({price:nowP, strength:st, desc:`your ${tfL} trendline`});
+        }
+      }
+      // strongest first
+      userLineLevels.sort((a,b)=>b.strength-a.strength);
+    }
+    // Build the authoritative-lines prompt block (kept as a var to avoid nested-quote issues)
+    let userLineBlock;
+    if(haveUserLines){
+      const gapRule = bot.useAiLines
+        ? 'You MAY add your OWN S/R line ONLY where there is an OBVIOUS gap — a clear price-reacting level the trader has NO line near. Be conservative: only add one if price is clearly reacting at a level far from any of the trader lines. Return such lines in "aiLines" (shown dotted on their chart). Do NOT duplicate or slightly shift the trader existing lines.'
+        : 'Rely SOLELY on the trader lines above for S/R. Do NOT invent your own S/R levels. Leave "aiLines" empty.';
+      userLineBlock = "🟦 THE TRADER'S OWN DRAWN LINES — YOUR AUTHORITATIVE SUPPORT/RESISTANCE. Hard rule: when judging support and resistance you MUST use these lines. They SUPERSEDE your own pivot/swing analysis. Their colour encodes strength by the timeframe drawn on — weekly strongest, then daily, 4h, 1h, ≤15m weakest:\n"
+        + userLines.join('\n') + '\n' + gapRule;
+    } else {
+      userLineBlock = 'No trader-drawn lines available — use your own pivot/swing S/R analysis.';
     }
     const pivotStr = `Swing highs: ${pivotHighs.slice(-8).map(p=>`[${new Date(times[p.i]*1000).toISOString().slice(5,16)} $${p.price.toFixed(0)}]`).join(' ')}
 Swing lows: ${pivotLows.slice(-8).map(p=>`[${new Date(times[p.i]*1000).toISOString().slice(5,16)} $${p.price.toFixed(0)}]`).join(' ')}`;
@@ -1413,11 +1455,7 @@ Swing lows: ${pivotLows.slice(-8).map(p=>`[${new Date(times[p.i]*1000).toISOStri
     // recent swing points (clustered swings = stronger horizontal S/R)
     for(const p of pivotHighs.slice(-6)) keyLevels.push({name:'swing high', price:p.price, weight:'moderate'});
     for(const p of pivotLows.slice(-6))  keyLevels.push({name:'swing low',  price:p.price, weight:'moderate'});
-    // user's own drawn horizontal lines = highest priority if present
-    if(bot.lineSource!=='ai' && savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines){
-      for(const ln of savedChartLines[bot.symbol].lines)
-        if(ln.isHoriz) keyLevels.push({name:'YOUR drawn level', price:ln.horizPrice, weight:'your level'});
-    }
+    // (User lines are now handled authoritatively above as userLineLevels.)
     const atLevels = keyLevels.filter(L => Math.abs(price-L.price)/price <= NEAR)
       .sort((a,b)=>Math.abs(price-a.price)-Math.abs(price-b.price));
     const srStr = atLevels.length
@@ -1459,7 +1497,7 @@ ${srStr ? `📍 PRICE IS AT STRONG SUPPORT/RESISTANCE RIGHT NOW: ${srStr}\nRever
 
 KEY LEVELS: prev daily H $${dHigh?.toFixed(0)} L $${dLow?.toFixed(0)} | weekly H $${wHigh?.toFixed(0)} L $${wLow?.toFixed(0)}
 
-${userLines.length?`TRADER'S OWN LINES (high priority):\n${userLines.join('\n')}`:''}
+${userLineBlock}
 
 LAST 60 CANDLES:
 ${candleStr}
@@ -1467,7 +1505,7 @@ ${candleStr}
 ${bot.lineSource==='user'?'Only trade setups that interact with the TRADER\'S OWN LINES.':''}
 
 Respond ONLY JSON:
-{"action":"long"|"short"|"close"|"hold","pattern":"name or none","leverage":1-${bot.maxLeverage},"tpPrice":number,"slPrice":number,"reasoning":"2 sentences max","lines":[{"label":"e.g. flag upper","p1":{"time":unix_seconds,"price":n},"p2":{"time":unix_seconds,"price":n}}]}
+{"action":"long"|"short"|"close"|"hold","pattern":"name or none","leverage":1-${bot.maxLeverage},"tpPrice":number,"slPrice":number,"reasoning":"2 sentences max","lines":[{"label":"e.g. flag upper","p1":{"time":unix_seconds,"price":n},"p2":{"time":unix_seconds,"price":n}}],"aiLines":[{"label":"gap S/R","price":n}]}
 "lines" = the pattern lines you see (max 4), so the trader can view them on their chart.
 
 MANDATORY: if action is long or short, you MUST provide both slPrice and tpPrice. slPrice goes on the losing side of entry (below for long, above for short); tpPrice on the winning side. A trade with no stop or no target is forbidden — if you can't define a sensible stop and target with at least ~2x reward:risk, choose "hold" instead.`;
@@ -1480,6 +1518,8 @@ MANDATORY: if action is long or short, you MUST provide both slPrice and tpPrice
     bot.decisions.push({t:Date.now(), candle:price, action:d.action, pattern:d.pattern, reasoning:d.reasoning});
     if(bot.decisions.length>50) bot.decisions.shift();
     if(d.lines && d.lines.length) bot.aiLines = d.lines.slice(0,4);
+    // Gap-fill S/R lines the AI added (only when useAiLines is on) — shown dotted on the AI page
+    bot.aiSrLines = (bot.useAiLines && Array.isArray(d.aiLines)) ? d.aiLines.slice(0,6).filter(l=>l && typeof l.price==='number') : [];
     aiBotLog(bot, `${d.action.toUpperCase()} ${d.pattern&&d.pattern!=='none'?'['+d.pattern+'] ':''}— ${d.reasoning}`,'info');
 
     if(d.action==='close' && bot.position) return aiBotClose(bot,'AI decision');
@@ -1924,6 +1964,12 @@ Only if the instruction is genuinely not an exit rule at all (gibberish, unrelat
     if(b.swingMode != null){ aiBots.pattern.swingMode = !!b.swingMode;
       blog(`🧠 Pattern bot swing mode ${aiBots.pattern.swingMode?'ON — will swing from S/R after reversals':'OFF — breakout only'}`,'ok'); saveState(); }
     if(b.lineSource){ aiBots.pattern.lineSource = b.lineSource; saveState(); }
+    if(b.useAiLines != null){
+      // useAiLines on → 'both' (your lines authoritative + AI fills obvious gaps); off → 'user' (only your lines)
+      aiBots.pattern.lineSource = b.useAiLines ? 'both' : 'user';
+      blog(`📐 Pattern bot lines: ${b.useAiLines?'YOUR lines + AI may fill obvious gaps (dotted)':'YOUR lines ONLY'}`,'ok');
+      saveState();
+    }
     return json(res,200,{swingMode:aiBots.pattern.swingMode, lineSource:aiBots.pattern.lineSource});
   }
   if(url==='/ai2/pattern/close' && req.method==='POST'){
@@ -2149,6 +2195,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
         for(const tr of bot.tradeHistory){ eq+=tr.pnl; out.push({t:tr.t, eq:+eq.toFixed(2)}); } return out; })(),
       startAllocation: bot.allocation||100,
       lineSource: bot.lineSource, aiLines: bot.aiLines, swingMode: !!bot.swingMode, riskPct: bot.maxRiskPct,
+      aiSrLines: bot.aiSrLines||[], useAiLines: (bot.lineSource==='both'||bot.lineSource==='ai'),
       userLines: (savedChartLines[bot.symbol] && savedChartLines[bot.symbol].lines) || [],
     });
   }
