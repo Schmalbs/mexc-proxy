@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.77';
+const SERVER_BUILD = '2026-06-14.79';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -623,7 +623,9 @@ async function runBot(bot){
         sendTelegram(`🎯 <b>Bot #${bot.id} TP${i+1} hit!</b> ${cfg.symbol}\nLevel: ${lvlLabel} | Closing ${lvl.size}% of position\nPrice: $${checkPrice||checkCandle?.close}`);
 
         const closeSide = t.side==='BUY' ? 4 : 2;
-        const r = await placeOrder(cfg.symbol, closeSide, exitVol, t.leverage, 1, 0, 5);
+        const r = (bot.paper || (cfg && cfg.paper) || t.paper)
+          ? { success:true, data:'PAPER' }   // paper: simulate the partial close, no real order
+          : await placeOrder(cfg.symbol, closeSide, exitVol, t.leverage, 1, 0, 5);
         if(r.success){
           t.qty -= exitVol;
           t.activeTpCount = i + 1;
@@ -925,9 +927,13 @@ async function exitTrade(bot, reason, price, completedTps){
   const emoji = pct>=0 ? '💰' : '🔻';
   sendTelegram(`${emoji} <b>Bot #${bot.id} ${reason} — trade closed</b>\nExit: $${price}\nP&L: ${pct>=0?'+':''}${pct}%${tpNote}`);
   const closeSide = t.side==='BUY' ? 4 : 2;
-  const res = await placeOrder(bot.config.symbol, closeSide, t.qty, t.leverage, 1, 0, 5);
-  if(res.success) blog(`✅ Exit order placed. ID: ${res.data}`, 'ok');
-  else blog(`Exit order error: ${JSON.stringify(res)}`, 'err');
+  if(bot.paper || (bot.config && bot.config.paper) || t.paper){
+    blog(`📝 PAPER exit — simulated, no real order placed.`, 'ok');
+  } else {
+    const res = await placeOrder(bot.config.symbol, closeSide, t.qty, t.leverage, 1, 0, 5);
+    if(res.success) blog(`✅ Exit order placed. ID: ${res.data}`, 'ok');
+    else blog(`Exit order error: ${JSON.stringify(res)}`, 'err');
+  }
   // ── Tag the linked research-library entry with the real outcome ──
   if(bot.config && bot.config.linkLibraryEntryId){
     const entry = researchLibrary.find(e=>e.id===bot.config.linkLibraryEntryId);
@@ -1831,6 +1837,55 @@ Only if the instruction is genuinely not an exit rule at all (gibberish, unrelat
   }
 
   // ── Attach/replace custom exit rules on a LIVE trade ──
+  if(url==='/bot/modify-trade' && req.method==='POST'){
+    const b = await readBody(req);
+    const bot = bots.find(x=>x.id===b.botId);
+    if(!bot || !bot.activeTrade) return json(res,400,{error:'no active trade for that bot'});
+    const t = bot.activeTrade;
+    const changes = [];
+
+    // Move SL
+    if(b.slPrice != null && !isNaN(parseFloat(b.slPrice))){
+      const newSl = parseFloat(b.slPrice);
+      // sanity: SL must be on the losing side of entry
+      const ok = t.side==='BUY' ? newSl < t.entryPrice : newSl > t.entryPrice;
+      if(!ok) return json(res,400,{error:`SL must be ${t.side==='BUY'?'below':'above'} entry $${t.entryPrice}`});
+      t.slPrice = newSl;
+      t.slLine = null; // a manual price overrides any moving-line SL
+      changes.push(`SL → $${newSl}`);
+      // if a real SL order sits on the exchange, replace it so they don't diverge
+      if(t.mexcSlOrderId && !bot.paper){
+        try{
+          await cancelStopOrder(bot.config.symbol, t.mexcSlOrderId);
+          const slSide = t.side==='BUY' ? 4 : 2;
+          const r = await placeStopOrder(bot.config.symbol, slSide, t.qty, newSl, t.leverage);
+          if(r && r.success){ t.mexcSlOrderId = r.data; changes.push('(exchange SL updated)'); }
+        }catch(e){ blog(`SL replace error: ${e.message}`,'warn'); }
+      }
+    }
+    // Move TP (single target / first level)
+    if(b.tpPrice != null && !isNaN(parseFloat(b.tpPrice))){
+      const newTp = parseFloat(b.tpPrice);
+      const ok = t.side==='BUY' ? newTp > t.entryPrice : newTp < t.entryPrice;
+      if(!ok) return json(res,400,{error:`TP must be ${t.side==='BUY'?'above':'below'} entry $${t.entryPrice}`});
+      t.tpPrice = newTp;
+      t.tpLine = null;
+      if(t.tpLevels && t.tpLevels.length){ t.tpLevels[0].type='price'; t.tpLevels[0].price=newTp; }
+      changes.push(`TP → $${newTp}`);
+    }
+    // Modify the close-percentage at each TP level
+    if(Array.isArray(b.levelSizes) && t.tpLevels){
+      b.levelSizes.forEach((sz,i)=>{ if(t.tpLevels[i] && sz!=null && !isNaN(parseFloat(sz))) t.tpLevels[i].size = parseFloat(sz); });
+      changes.push(`TP sizes → ${t.tpLevels.map(l=>l.size+'%').join('/')}`);
+    }
+
+    if(!changes.length) return json(res,400,{error:'nothing to modify'});
+    blog(`✏️ Bot #${bot.id} trade modified: ${changes.join(', ')}`,'ok');
+    sendTelegram(`✏️ <b>Bot #${bot.id} trade modified</b>\n${changes.join('\n')}`);
+    saveState();
+    return json(res,200,{ok:true, slPrice:t.slPrice, tpPrice:t.tpPrice, tpLevels:t.tpLevels});
+  }
+
   if(url==='/bot/set-exits' && req.method==='POST'){
     const b = await readBody(req);
     const bot = bots.find(x=>x.id===b.botId);
@@ -2256,6 +2311,7 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
           }catch(e){ return null; }
         })(),
         manualOnly: !!b.config.manualOnly,
+        paper: !!b.paper,
         leverage: b.config.leverage,
         qty: b.config.qty,
         activeTrade: b.activeTrade,
@@ -2269,6 +2325,31 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
   if(url==='/trade/open' && req.method==='POST'){
     const b = await readBody(req);
     b.qty = Math.max(1, Math.round(parseFloat(b.qty)||1));
+    const isPaper = !!b.paper;
+
+    // PAPER MODE: simulate the fill, no real order, no leverage change on MEXC.
+    // The trade is still managed 24/7 for TP/SL exactly like a live one.
+    if(isPaper){
+      const bot = {
+        id: ++botIdCounter,
+        paper: true,
+        config: { symbol: b.symbol, manualOnly: true, paper: true, leverage: b.leverage, marginType: b.marginType, qty: b.qty,
+                  tp:{mode:b.tpMode,type:'pct',value:0,tf:b.tpTf}, sl:{mode:b.slMode,type:'pct',value:0,tf:b.slTf} },
+        activeTrade: {
+          side: b.side, entryPrice: b.entryPrice, tpPrice: b.tpPrice, slPrice: b.slPrice,
+          qty: b.qty, leverage: b.leverage, paper: true,
+          tpLevels: Array.isArray(b.tpLevels) && b.tpLevels.length ? b.tpLevels : [{type:'price', price:b.tpPrice, size:100}],
+          tp: { mode: b.tpMode, tf: b.tpTf }, sl: { mode: b.slMode, tf: b.slTf },
+          openedAt: Date.now(),
+        },
+        lastCandleTime: null, lastTpCandle: null, lastSlCandle: null, syncCounter: 0,
+      };
+      bots.push(bot);
+      blog(`📝 PAPER ${b.side} opened @ ${b.entryPrice} (simulated as Bot #${bot.id}) — no real order placed`, 'ok');
+      saveState();
+      return json(res,200,{success:true, orderId:'PAPER', botId: bot.id, paper:true});
+    }
+
     if(b.leverage > 1){
       await mexcRequest('POST','/api/v1/private/position/change_leverage',{
         symbol: b.symbol, leverage: b.leverage, openType: b.marginType==='isolated'?1:2
@@ -2315,7 +2396,9 @@ Only add that tag if it's genuinely a durable instruction/lesson — not for ord
 
     const closeVol = Math.max(1, Math.floor(bot.activeTrade.qty * fraction));
     const closeSide = bot.activeTrade.side==='BUY' ? 4 : 2;
-    const r = await placeOrder(symbol, closeSide, closeVol, bot.activeTrade.leverage, 1, 0, 5);
+    const r = (bot.paper || (bot.config && bot.config.paper) || bot.activeTrade.paper)
+      ? { success:true, data:'PAPER' }
+      : await placeOrder(symbol, closeSide, closeVol, bot.activeTrade.leverage, 1, 0, 5);
     if(r.success){
       bot.activeTrade.qty -= closeVol;
       blog(`Bot #${bot.id} partial close ${Math.round(fraction*100)}% (${closeVol} contracts) @ ${price}`, 'ok');
