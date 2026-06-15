@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.70';
+const SERVER_BUILD = '2026-06-14.75';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -258,12 +258,19 @@ function priceOnLine(line, t){
 }
 
 async function getLastClosedCandle(symbol, interval){
-  const d = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${interval}&limit=3`);
+  const d = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${interval}&limit=5`);
   if(!d || !d.success || !d.data || !d.data.time || d.data.time.length < 2) return null;
   const i = d.data.time.length - 2;
   const prevClose = i>=1 ? parseFloat(d.data.close[i-1]) : null;
+  // prior two candles (for rejection wicks / morning-evening star detection)
+  const at = j => (j>=0 && j<d.data.time.length) ? {
+    o:parseFloat(d.data.open[j]), h:parseFloat(d.data.high[j]),
+    l:parseFloat(d.data.low[j]), c:parseFloat(d.data.close[j])
+  } : null;
   return { time: parseInt(d.data.time[i]), close: parseFloat(d.data.close[i]),
-           high: parseFloat(d.data.high[i]), low: parseFloat(d.data.low[i]), prevClose };
+           open: parseFloat(d.data.open[i]),
+           high: parseFloat(d.data.high[i]), low: parseFloat(d.data.low[i]), prevClose,
+           c1: at(i-1), c2: at(i-2) }; // c1 = prior candle, c2 = two back
 }
 
 async function getTicker(symbol){
@@ -337,6 +344,93 @@ async function botTick(){
   // Iterate over a copy so disarms during the loop are safe
   for(const bot of [...bots]){
     await runBot(bot).catch(e => blog(`Bot #${bot.id} tick error: ${e.message}`,'err'));
+  }
+}
+
+// ── AI-JUDGED SWING (opt-in alternative to mechanical detection) ──
+// Asks Claude whether the just-closed candle is a genuine swing entry at the
+// line. Uses Sonnet (cheap) since this runs per candle on armed swing bots.
+async function aiSwingJudge(symbol, tf, side, lp, candle){
+  if(!ANTHROPIC_KEY) return null;
+  const k = await mexcPublic(`/api/v1/contract/kline/${symbol}?interval=${tf}&limit=30`);
+  if(!k || !k.success) return null;
+  const closes=k.data.close.map(Number), highs=k.data.high.map(Number), lows=k.data.low.map(Number), opens=k.data.open.map(Number);
+  // Drop the still-forming candle (MEXC returns it as the last element) so the
+  // newest candle the AI sees is the genuinely CLOSED one — matches live behaviour.
+  const n = closes.length - 1; // exclusive end = exclude forming candle
+  const startI = Math.max(0, n - 20);
+  const recent = [];
+  for(let i=startI; i<n; i++) recent.push(`O${opens[i]} H${highs[i]} L${lows[i]} C${closes[i]}`);
+  const recentStr = recent.join('\n');
+  const longRules = `For a LONG (support holding / bullish reversal) at the line, look for ANY of these — judged across the LAST FEW candles, not just one:
+- A wick at/below the line (within ~0.15%) that CLOSES back above it (support held / bullish SFP / liquidity sweep)
+- A bullish REJECTION candle at the line: long lower wick, closes in the upper part of its range
+- A MORNING STAR at the line: a down candle, then a small-bodied candle near the line, then a strong up candle closing back into the first candle's body (3-candle pattern)
+- A bullish ENGULFING at the line: a down candle fully engulfed by the next up candle
+- Optional confirmation: a following candle that holds above the line adds conviction`;
+  const shortRules = `For a SHORT (resistance holding / bearish reversal) at the line, look for ANY of these — judged across the LAST FEW candles, not just one:
+- A wick at/above the line (within ~0.15%) that CLOSES back below it (resistance held / bearish SFP / liquidity sweep)
+- A bearish REJECTION candle at the line: long upper wick, closes in the lower part of its range
+- An EVENING STAR at the line: an up candle, then a small-bodied candle near the line, then a strong down candle closing back into the first candle's body (3-candle pattern)
+- A bearish ENGULFING at the line: an up candle fully engulfed by the next down candle
+- Optional confirmation: a following candle that holds below the line adds conviction`;
+  const prompt = `You are judging whether to take a swing ${side==='BUY'?'LONG':'SHORT'} at the level $${lp.toFixed(2)} on ${symbol} (${tf}).
+
+${side==='BUY'?longRules:shortRules}
+
+IMPORTANT: A valid reversal often takes MORE THAN ONE candle to confirm — a sweep candle then a reclaim, or the three candles of a star. You are given the recent candles so you can judge the pattern as it develops, not just the single most-recent close. Be conservative: a mere touch with no rejection, price slicing cleanly through the level, or an ambiguous candle is NOT an entry — answer false and wait. Only enter on a genuine, recognisable rejection/reversal at THIS level.
+
+Last 20 ${tf} candles (oldest first, newest last):
+${recentStr}
+
+The newest candle above is the just-closed one. Level: $${lp.toFixed(2)}.
+Respond ONLY JSON: {"enter":true|false,"pattern":"name the pattern or 'none'","reason":"under 15 words"}`;
+  try{
+    const raw = await callClaude(prompt, DECISION_MODEL); // Opus — swing bots fire rarely, so the per-call cost is negligible
+    const d = JSON.parse(raw.replace(/```json|```/g,'').trim());
+    return { enter: !!d.enter, reason: (d.pattern && d.pattern!=='none' ? d.pattern+': ' : '') + (d.reason||'') };
+  }catch(e){ return null; }
+}
+
+// ── MECHANICAL SWING DETECTION (for trigger-bot swing mode) ──
+// Given the just-closed candle and a line price, decide if it's a valid swing
+// LONG (support held / bullish SFP / bullish rejection wick / morning star) or
+// SHORT (resistance held / bearish SFP / bearish rejection wick / evening star).
+// All deterministic — no AI. tol = proximity fraction (e.g. 0.0015 for 0.15%).
+function detectSwingSignal(candle, lp, wantSide, tol){
+  const { open:o, high:h, low:l, close:c, c1, c2 } = candle;
+  const near = (price) => Math.abs(price - lp) <= lp * tol;
+  const range = (h - l) || 1;
+  const body = Math.abs(c - o);
+  const upperWick = h - Math.max(o, c);
+  const lowerWick = Math.min(o, c) - l;
+  const reasons = [];
+
+  if(wantSide === 'BUY'){
+    // 1. Support held / bullish SFP: low tested the line (touch, pierce, or within tol) and close is back above
+    if((l <= lp || near(l)) && c > lp) reasons.push('support held / bullish SFP (low tested line, closed above)');
+    // 2. Bullish rejection candle near the line: long lower wick, closes in upper third
+    if(near(l) || near(Math.min(o,c))){
+      if(lowerWick >= range*0.5 && c >= h - range*0.34) reasons.push('bullish rejection wick at line');
+    }
+    // 3. Morning star at the line (c2 bearish, c1 small body, current bullish closing into c2 body), low near line
+    if(c1 && c2){
+      const b2 = Math.abs(c2.c-c2.o), b1 = Math.abs(c1.c-c1.o), avg = (body+b1+b2)/3 || 1;
+      if(c2.c < c2.o && b1 < avg*0.6 && c > o && c > (c2.o+c2.c)/2 && b2 > avg*0.6 && (near(l)||near(c1.l)))
+        reasons.push('morning star at line');
+    }
+    return reasons.length ? reasons[0] : null;
+  } else { // SELL
+    if((h >= lp || near(h)) && c < lp) reasons.push('resistance held / bearish SFP (high tested line, closed below)');
+    if(near(h) || near(Math.max(o,c))){
+      if(upperWick >= range*0.5 && c <= l + range*0.34) reasons.push('bearish rejection wick at line');
+    }
+    if(c1 && c2){
+      const b2 = Math.abs(c2.c-c2.o), b1 = Math.abs(c1.c-c1.o), avg = (body+b1+b2)/3 || 1;
+      if(c2.c > c2.o && b1 < avg*0.6 && c < o && c < (c2.o+c2.c)/2 && b2 > avg*0.6 && (near(h)||near(c1.h)))
+        reasons.push('evening star at line');
+    }
+    return reasons.length ? reasons[0] : null;
   }
 }
 
@@ -568,8 +662,10 @@ async function runBot(bot){
   bot.lastCandleTime = candle.time;
 
   const dir  = cfg.dir;
-  const side = dir==='above' ? 'BUY' : 'SELL';
+  const isSwing = dir === 'swingLong' || dir === 'swingShort';
+  const side = (dir==='above' || dir==='swingLong') ? 'BUY' : 'SELL';
   let triggered = false, triggerLabel = '';
+  const swingTol = (cfg.swingTolPct != null ? cfg.swingTolPct : 0.15) / 100;
 
   // PENETRATION BUFFER: the close must clear the level by this fraction, so a
   // fractional poke through a line (esp. a rising trend line price is riding
@@ -581,8 +677,20 @@ async function runBot(bot){
 
   if(cfg.triggerSource === 'price'){
     const tp = parseFloat(cfg.manualPrice);
-    triggered = (dir==='above' && above(candle.close, tp)) || (dir==='below' && below(candle.close, tp));
-    triggerLabel = `manual price ${tp}`;
+    if(isSwing){
+      if(cfg.swingMode === 'ai'){
+        const verdict = await aiSwingJudge(cfg.symbol, cfg.trigTf, side, tp, candle).catch(()=>null);
+        triggered = !!(verdict && verdict.enter);
+        triggerLabel = `price ${tp} — AI swing${triggered?': '+(verdict.reason||''):''}`;
+      } else {
+        const sig = detectSwingSignal(candle, tp, side, swingTol);
+        triggered = !!sig;
+        triggerLabel = `price ${tp} — ${sig||'no swing signal'}`;
+      }
+    } else {
+      triggered = (dir==='above' && above(candle.close, tp)) || (dir==='below' && below(candle.close, tp));
+      triggerLabel = `manual price ${tp}`;
+    }
   } else {
     // 'all' is no longer offered in the UI. A legacy bot still carrying 'all'
     // is neutralised here: we require a single explicit line. This prevents the
@@ -607,6 +715,20 @@ async function runBot(bot){
 
     for(const line of validLines){
       const lp = priceOnLine(line, candle.time);
+
+      // ── SWING MODE (mechanical): support/resistance hold, SFP, rejection wick, star ──
+      if(isSwing){
+        if(cfg.swingMode === 'ai'){
+          // AI-judged swing: ask Claude whether this is a valid swing entry at the line
+          const verdict = await aiSwingJudge(cfg.symbol, cfg.trigTf, side, lp, candle).catch(()=>null);
+          if(verdict && verdict.enter){ triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(2)} — AI swing: ${verdict.reason||''}`; break; }
+          continue;
+        }
+        const sig = detectSwingSignal(candle, lp, side, swingTol);
+        if(sig){ triggered = true; triggerLabel = `line #${line.id} @ ${lp.toFixed(2)} — ${sig}`; break; }
+        continue;
+      }
+
       const closedThroughNow = (dir==='above' && above(candle.close, lp)) || (dir==='below' && below(candle.close, lp));
       if(!closedThroughNow) continue;
       // Require a genuine CROSSING: the prior candle must have closed on the
@@ -625,7 +747,7 @@ async function runBot(bot){
   }
 
   // ── BREAK + RETEST CONFIRMATION (optional) ──
-  if(cfg.retestConfirm){
+  if(cfg.retestConfirm && !isSwing){
     const TOL = 0.001; // 0.1% touch tolerance toward the line
 
     if(bot.phase === 'retest'){
@@ -801,6 +923,7 @@ setInterval(botTick, 8000); // bot heartbeat every 8s
 // AI TRADER — Claude makes every trading decision via the API
 // ─────────────────────────────────────────────────────────────
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+const DECISION_MODEL = 'claude-opus-4-8'; // trade decisions use Opus 4.8; everything else stays on Sonnet 4.6
 const YOUTUBE_KEY   = process.env.YOUTUBE_API_KEY || '';
 
 // Analyst YouTube channel handles → fetch their latest video via the Data API.
@@ -857,10 +980,10 @@ function httpsGetJson(url){
 
 
 
-function callClaude(prompt){
+function callClaude(prompt, model){
   return new Promise((resolve, reject)=>{
     const body = JSON.stringify({
-      model: 'claude-sonnet-4-6', // upgraded from Sonnet 4 (2026-06-13)
+      model: model || 'claude-sonnet-4-6', // default Sonnet; trade DECISION passes Opus
       max_tokens: 1024,
       messages: [{ role:'user', content: prompt }],
     });
@@ -1349,7 +1472,7 @@ Respond ONLY JSON:
 
 MANDATORY: if action is long or short, you MUST provide both slPrice and tpPrice. slPrice goes on the losing side of entry (below for long, above for short); tpPrice on the winning side. A trade with no stop or no target is forbidden — if you can't define a sensible stop and target with at least ~2x reward:risk, choose "hold" instead.`;
 
-    const raw = await callClaude(prompt);
+    const raw = await callClaude(prompt, DECISION_MODEL);
     let d;
     try{ d = JSON.parse(raw.replace(/```json|```/g,'').trim()); }
     catch(e){ return aiBotLog(bot,`bad decision JSON: ${raw.slice(0,100)}`,'err'); }
@@ -1390,7 +1513,7 @@ Decide: keep holding, adjust the stop/target (e.g. trail stop to lock profit, or
 A stop-loss and take-profit MUST always remain set — you may move them but never remove them. Only move a stop in the trade's favour (never widen risk).
 Respond ONLY JSON: {"action":"hold"|"adjust"|"close","slPrice":number,"tpPrice":number,"reasoning":"1 sentence"}`;
   let raw, d;
-  try{ raw = await callClaude(prompt); d = JSON.parse(raw.replace(/```json|```/g,'').trim()); }
+  try{ raw = await callClaude(prompt, DECISION_MODEL); d = JSON.parse(raw.replace(/```json|```/g,'').trim()); }
   catch(e){ return; } // on any failure, leave the position exactly as-is (still protected)
 
   if(d.action==='close'){ aiBotLog(bot,`review→close: ${d.reasoning}`,'info'); return aiBotClose(bot,'AI review close'); }
@@ -1934,6 +2057,15 @@ Give your honest companion response:`;
     if(researchLibrary.length>100) researchLibrary.shift();
     saveState();
     return json(res,200,{ok:true, entry, count:researchLibrary.length});
+  }
+  if(url==='/backtest/context'){
+    // Returns the journal + library prompt blocks EXACTLY as the live decision
+    // prompt builds them, so the backtest script matches the live bot byte-for-byte.
+    return json(res,200,{
+      journalBlock: journalForPrompt(),
+      libraryBlock: libraryForPrompt(),
+      libraryEnabled,
+    });
   }
   if(url.startsWith('/library/list')){
     return json(res,200,{ entries: researchLibrary.slice(-50), enabled: libraryEnabled, count: researchLibrary.length });
