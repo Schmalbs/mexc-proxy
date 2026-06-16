@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.81';
+const SERVER_BUILD = '2026-06-14.82';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -690,10 +690,13 @@ async function runBot(bot){
   const swingTol = (cfg.swingTolPct != null ? cfg.swingTolPct : 0.15) / 100;
 
   // PENETRATION BUFFER: the close must clear the level by this fraction, so a
-  // fractional poke through a line (esp. a rising trend line price is riding
-  // along) doesn't count as a real break. Default 0.1%; set cfg.breakBufferPct
-  // to 0 to restore exact-touch behaviour.
-  const bufPct = (cfg.breakBufferPct != null ? cfg.breakBufferPct : 0.1) / 100;
+  // fractional poke through a LINE (esp. a sloped trend line the price rides
+  // along) doesn't count as a real break. This only applies to LINE triggers —
+  // for a manual price you've named an exact level, so the buffer is OFF and the
+  // close just has to clear the exact price. Default 0.1% for lines.
+  const bufPct = (cfg.triggerSource === 'price')
+    ? 0
+    : (cfg.breakBufferPct != null ? cfg.breakBufferPct : 0.1) / 100;
   const above = (close, level) => close > level * (1 + bufPct);
   const below = (close, level) => close < level * (1 - bufPct);
 
