@@ -10,7 +10,7 @@
 // ─────────────────────────────────────────────────────────────
 const http   = require('http');
 const https  = require('https');
-const SERVER_BUILD = '2026-06-14.82';
+const SERVER_BUILD = '2026-06-14.83';
 const fs = require('fs');
 
 // ── PERSISTENCE ── Railway mounts a volume at RAILWAY_VOLUME_MOUNT_PATH.
@@ -523,8 +523,12 @@ async function runBot(bot){
         // resolve the level (price, or line value at this candle's time)
         let lvl = rule.level;
         if(rule.lineId != null){
-          const ln = (cfg.lines||[]).find(L=>String(L.id)===String(rule.lineId));
-          if(ln) lvl = priceOnLine(ln, c.time);
+          if(rule.lineGeom){
+            lvl = priceOnLine(rule.lineGeom, c.time);
+          } else {
+            const ln = (cfg.lines||[]).find(L=>String(L.id)===String(rule.lineId));
+            if(ln) lvl = priceOnLine(ln, c.time);
+          }
         }
         if(lvl == null) continue;
         const below = rule.operator==='below';
@@ -1943,6 +1947,15 @@ Only if the instruction is genuinely not an exit rule at all (gibberish, unrelat
     t._retestStage = t._retestStage || {};
     for(const rule of incoming){
       if(t.customExits.length >= 5) break;
+      // If the rule references a drawn line, snapshot its geometry onto the rule
+      // so the engine can resolve it without depending on cfg.lines (which a live
+      // trade may not carry). Lines may arrive in b.lines or within the rule.
+      if(rule.lineId != null && !rule.lineGeom){
+        const srcLines = Array.isArray(b.lines) ? b.lines : (Array.isArray(rule.lines)?rule.lines:[]);
+        const ln = srcLines.find(L=>String(L.id)===String(rule.lineId));
+        if(ln) rule.lineGeom = { isHoriz:!!ln.isHoriz, horizPrice:ln.horizPrice, p1:ln.p1, p2:ln.p2 };
+      }
+      delete rule.lines; // don't store the whole array on the rule
       t.customExits.push(rule);
       const ri = t.customExits.length - 1;
       const ruleKey = (rule.kind||'simple') + ':' + ri + ':' + rule.tf + ':' + (rule.lineId!=null?('L'+rule.lineId):rule.level);
